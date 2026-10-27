@@ -23,6 +23,8 @@ except (ValueError, ImportError):
     Poppler = None
     HAS_POPPLER = False
 
+SUPPORTED_EXTENSIONS = ('.xnote', '.xcanvas', '.xtemplate', '.md', '.markdown')
+
 DEFAULT_RULED_TEMPLATE_ID = "6f16f292a66422f3"
 DEFAULT_RULED_TEMPLATE = {
     "xtemplate": 1,
