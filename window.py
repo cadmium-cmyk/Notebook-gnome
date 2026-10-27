@@ -576,26 +576,42 @@ class XNotesViewerWindow(Adw.ApplicationWindow):
             icon_name=self._resolve_icon_name("tool-pen-symbolic", "document-edit-symbolic"),
             group=self.select_tool_btn,
             active=True,
-            tooltip_text="Pressure-Sensitive Pen (Smoothed)"
+            tooltip_text="Standard Pressure Pen"
         )
         self.pen_tool_btn.connect("toggled", self._on_tool_toggled, "pen")
         tool_group_box.append(self.pen_tool_btn)
 
-        self.vel_pen_tool_btn = Gtk.ToggleButton(
-            icon_name=self._resolve_icon_name("tool-fountain-pen-symbolic", "applications-engineering-symbolic"),
+        self.dashed_tool_btn = Gtk.ToggleButton(
+            icon_name=self._resolve_icon_name("tool-dashed-symbolic", "view-more-horizontal-symbolic"),
             group=self.select_tool_btn,
-            tooltip_text="Velocity-Thinning Fountain Pen (Fast Strokes Taper Thin)"
+            tooltip_text="Dashed Line Pen"
         )
-        self.vel_pen_tool_btn.connect("toggled", self._on_tool_toggled, "velocity_pen")
-        tool_group_box.append(self.vel_pen_tool_btn)
+        self.dashed_tool_btn.connect("toggled", self._on_tool_toggled, "dashed")
+        tool_group_box.append(self.dashed_tool_btn)
 
         self.callig_tool_btn = Gtk.ToggleButton(
             icon_name=self._resolve_icon_name("tool-calligraphy-symbolic", "font-x-generic-symbolic"),
             group=self.select_tool_btn,
-            tooltip_text="Calligraphic Chisel-Nib Pen (Pressure + Angle)"
+            tooltip_text="Calligraphic Chisel-Nib Pen (Pressure + Direction)"
         )
         self.callig_tool_btn.connect("toggled", self._on_tool_toggled, "calligraphy")
         tool_group_box.append(self.callig_tool_btn)
+
+        self.vel_pen_tool_btn = Gtk.ToggleButton(
+            icon_name=self._resolve_icon_name("tool-fountain-pen-symbolic", "applications-engineering-symbolic"),
+            group=self.select_tool_btn,
+            tooltip_text="Velocity / Speed Pen (Fast Strokes Taper Thin)"
+        )
+        self.vel_pen_tool_btn.connect("toggled", self._on_tool_toggled, "speed")
+        tool_group_box.append(self.vel_pen_tool_btn)
+
+        self.taper_tool_btn = Gtk.ToggleButton(
+            icon_name=self._resolve_icon_name("tool-taper-symbolic", "go-last-symbolic"),
+            group=self.select_tool_btn,
+            tooltip_text="Tapered Brush Pen"
+        )
+        self.taper_tool_btn.connect("toggled", self._on_tool_toggled, "taper")
+        tool_group_box.append(self.taper_tool_btn)
 
         self.hi_tool_btn = Gtk.ToggleButton(
             icon_name=self._resolve_icon_name("tool-highlighter-symbolic", "applications-graphics-symbolic"),
@@ -646,7 +662,7 @@ class XNotesViewerWindow(Adw.ApplicationWindow):
             tooltip_text="Stroke / Text Ink Color (Also Recolors Lasso Selection)"
         )
         rgba = Gdk.RGBA()
-        rgba.parse("rgb(20,24,35)")
+        rgba.parse("rgb(213,68,37)")
         self.color_btn.set_rgba(rgba)
         self.color_btn.connect("color-set", self._on_color_changed)
         self.stylus_bar.append(self.color_btn)
@@ -658,8 +674,8 @@ class XNotesViewerWindow(Adw.ApplicationWindow):
         size_icon.set_tooltip_text("Stroke Thickness / Eraser Size")
         size_box.append(size_icon)
 
-        self.width_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1.0, 28.0, 0.5)
-        self.width_scale.set_value(3.6)
+        self.width_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1.0, 32.0, 0.5)
+        self.width_scale.set_value(9.3)
         self.width_scale.set_size_request(115, -1)
         self.width_scale.set_draw_value(False)
         self.width_scale.set_tooltip_text("Adjust Tool Thickness (Also Resizes Lasso-Selected Strokes)")
@@ -2094,7 +2110,7 @@ class XNotesViewerWindow(Adw.ApplicationWindow):
         self.canvas.active_tool = tool_name
         if tool_name not in ("select", "lasso"):
             self.canvas.clear_selection()
-        if tool_name in ("pen", "velocity_pen", "calligraphy"):
+        if tool_name in ("pen", "dashed", "speed", "velocity_pen", "calligraphy", "taper"):
             self.width_scale.set_value(self.canvas.pen_width)
         elif tool_name == "highlighter":
             self.width_scale.set_value(self.canvas.highlighter_width)
@@ -2118,7 +2134,7 @@ class XNotesViewerWindow(Adw.ApplicationWindow):
 
     def _on_width_changed(self, scale):
         val = scale.get_value()
-        if self.canvas.active_tool in ("pen", "velocity_pen", "calligraphy"):
+        if self.canvas.active_tool in ("pen", "dashed", "speed", "velocity_pen", "calligraphy", "taper"):
             self.canvas.pen_width = val
         elif self.canvas.active_tool == "highlighter":
             self.canvas.highlighter_width = val

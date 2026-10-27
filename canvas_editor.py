@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import math
 import copy
@@ -14,7 +15,7 @@ from xnote_io import XTemplateEvaluator, XNotePackageParser
 
 
 class XNoteCanvas(Gtk.DrawingArea):
-    """Interactive Cairo canvas supporting smoothed strokes, velocity pen, lasso selection, PDF pages, and images."""
+    """Interactive Cairo canvas supporting Android .xnote stroke configs, xtemplate v1, PDF pages, and images."""
 
     def __init__(self, on_modified_cb=None, on_history_changed_cb=None, on_selection_changed_cb=None):
         super().__init__()
@@ -40,11 +41,11 @@ class XNoteCanvas(Gtk.DrawingArea):
         self.vadj = None
 
         # Stylus / Tool settings:
-        # "select", "lasso", "pen", "velocity_pen", "calligraphy", "highlighter", "eraser", "text"
+        # "select", "lasso", "pen", "dashed", "calligraphy", "speed", "taper", "highlighter", "eraser", "text"
         self.active_tool = "pen"
-        self.pen_rgba = [20, 24, 35, 255]
-        self.pen_width = 3.6
-        self.highlighter_width = 22.0
+        self.pen_rgba = [213, 68, 37, 255]
+        self.pen_width = 9.3
+        self.highlighter_width = 27.65
         self.eraser_radius = 16.0
         self.text_size_pt = 14.0
         self.nib_angle_rad = math.radians(35.0)
@@ -71,10 +72,10 @@ class XNoteCanvas(Gtk.DrawingArea):
         self._transform_modified = False
 
         # Lasso multi-item selection & transform state
-        self._lasso_polygon = []          # [(px, py), ...] while drawing freehand loop
+        self._lasso_polygon = []
         self.lasso_page_idx = None
-        self.lasso_item_indices = []      # indices of selected items on lasso_page_idx
-        self.lasso_bbox = None            # [x, y, w, h] in page coords
+        self.lasso_item_indices = []
+        self.lasso_bbox = None
         self._lasso_transform_mode = None  # "move", "nw", "ne", "se", "sw"
         self._lasso_start_pt = (0.0, 0.0)
         self._lasso_orig_bbox = None
@@ -193,10 +194,10 @@ class XNoteCanvas(Gtk.DrawingArea):
     # Brush Stroke Smoothing (Chaikin Corner-Cutting Subdivision)
     # =========================================================================
     @staticmethod
-    def smooth_samples_chaikin(samples, iterations=2):
+    def smooth_samples_chaikin(samples, iterations=1):
         """
-        Smooth a sequence of [x, y, pressure] samples using Chaikin's corner-cutting
-        algorithm while preserving start and end points and interpolating pressure.
+        Smooth a sequence of [x, y, pressure] or [x, y, pressure, dt_ms] samples
+        while preserving any 4th delta-time element.
         """
         if not samples or len(samples) < 3:
             return samples
@@ -204,32 +205,43 @@ class XNoteCanvas(Gtk.DrawingArea):
         pts = []
         for s in samples:
             if isinstance(s, dict):
-                pts.append([float(s.get("x", 0.0)), float(s.get("y", 0.0)), float(s.get("pressure", 0.65))])
+                pts.append([
+                    float(s.get("x", 0.0)),
+                    float(s.get("y", 0.0)),
+                    float(s.get("pressure", 0.5)),
+                    float(s.get("dt", 0.0))
+                ])
             else:
                 px = float(s[0]) if len(s) > 0 else 0.0
                 py = float(s[1]) if len(s) > 1 else 0.0
-                pr = float(s[2]) if len(s) > 2 else 0.65
-                pts.append([px, py, pr])
+                pr = float(s[2]) if len(s) > 2 else 0.5
+                dt = float(s[3]) if len(s) > 3 else None
+                pts.append([px, py, pr] if dt is None else [px, py, pr, dt])
 
         for _ in range(iterations):
-            if len(pts) < 3 or len(pts) > 1200:
+            if len(pts) < 3 or len(pts) > 900:
                 break
+            has_dt = len(pts[0]) >= 4
             new_pts = [pts[0]]
             for i in range(len(pts) - 1):
                 p0 = pts[i]
                 p1 = pts[i + 1]
-                q = [
-                    round(0.75 * p0[0] + 0.25 * p1[0], 2),
-                    round(0.75 * p0[1] + 0.25 * p1[1], 2),
-                    round(0.75 * p0[2] + 0.25 * p1[2], 3),
-                ]
-                r = [
-                    round(0.25 * p0[0] + 0.75 * p1[0], 2),
-                    round(0.25 * p0[1] + 0.75 * p1[1], 2),
-                    round(0.25 * p0[2] + 0.75 * p1[2], 3),
-                ]
-                new_pts.append(q)
-                new_pts.append(r)
+                qx = round(0.75 * p0[0] + 0.25 * p1[0], 2)
+                qy = round(0.75 * p0[1] + 0.25 * p1[1], 2)
+                qp = round(0.75 * p0[2] + 0.25 * p1[2], 3)
+
+                rx = round(0.25 * p0[0] + 0.75 * p1[0], 2)
+                ry = round(0.25 * p0[1] + 0.75 * p1[1], 2)
+                rp = round(0.25 * p0[2] + 0.75 * p1[2], 3)
+
+                if has_dt:
+                    dt1 = p1[3] if len(p1) >= 4 else 8.0
+                    half_dt = max(1, int(round(dt1 * 0.5)))
+                    new_pts.append([qx, qy, qp, half_dt])
+                    new_pts.append([rx, ry, rp, half_dt])
+                else:
+                    new_pts.append([qx, qy, qp])
+                    new_pts.append([rx, ry, rp])
             new_pts.append(pts[-1])
             pts = new_pts
 
@@ -256,6 +268,13 @@ class XNoteCanvas(Gtk.DrawingArea):
     def has_lasso_selection(self):
         return bool(self.lasso_item_indices and self.lasso_page_idx is not None and self.lasso_bbox is not None)
 
+    @staticmethod
+    def _get_stroke_base_width(item):
+        cfg = item.get("config")
+        if isinstance(cfg, dict) and "base_width" in cfg:
+            return float(cfg["base_width"])
+        return float(item.get("stroke_width", item.get("width", 3.2)))
+
     def _compute_items_bbox(self, page_idx, indices):
         if not self.document or page_idx is None or not indices:
             return None
@@ -273,7 +292,7 @@ class XNoteCanvas(Gtk.DrawingArea):
             item = items[idx]
             kind = item.get("kind") or item.get("type")
             if kind == "stroke":
-                hw = float(item.get("stroke_width", 3.0)) / 2.0
+                hw = self._get_stroke_base_width(item) / 2.0
                 for s in item.get("samples") or item.get("points") or []:
                     sx = float(s["x"]) if isinstance(s, dict) else float(s[0])
                     sy = float(s["y"]) if isinstance(s, dict) else float(s[1])
@@ -337,9 +356,15 @@ class XNoteCanvas(Gtk.DrawingArea):
             item = items[idx]
             kind = item.get("kind") or item.get("type")
             if kind == "stroke":
-                old_rgba = item.get("stroke_rgba", [0, 0, 0, 255])
-                alpha = old_rgba[3] if len(old_rgba) >= 4 else 255
-                item["stroke_rgba"] = [rgba[0], rgba[1], rgba[2], alpha]
+                cfg = item.get("config")
+                if isinstance(cfg, dict):
+                    old_rgba = cfg.get("rgba", [0, 0, 0, 255])
+                    alpha = old_rgba[3] if len(old_rgba) >= 4 else 255
+                    cfg["rgba"] = [rgba[0], rgba[1], rgba[2], alpha]
+                if "stroke_rgba" in item:
+                    old_rgba = item.get("stroke_rgba", [0, 0, 0, 255])
+                    alpha = old_rgba[3] if len(old_rgba) >= 4 else 255
+                    item["stroke_rgba"] = [rgba[0], rgba[1], rgba[2], alpha]
                 changed = True
             elif kind == "text":
                 item["rgba"] = [rgba[0], rgba[1], rgba[2], 255]
@@ -366,7 +391,10 @@ class XNoteCanvas(Gtk.DrawingArea):
             if 0 <= idx < len(items):
                 item = items[idx]
                 if (item.get("kind") or item.get("type")) == "stroke":
-                    item["stroke_width"] = round(float(new_width), 2)
+                    if isinstance(item.get("config"), dict):
+                        item["config"]["base_width"] = round(float(new_width), 2)
+                    if "stroke_width" in item:
+                        item["stroke_width"] = round(float(new_width), 2)
                     changed = True
 
         if changed:
@@ -655,7 +683,7 @@ class XNoteCanvas(Gtk.DrawingArea):
         self.queue_draw()
 
     # =========================================================================
-    # Stylus & Mouse Input Handling
+    # Stylus & Mouse Input Handling (Produces Android-Compatible Stroke Schema)
     # =========================================================================
     def _is_shift_held(self, is_stylus=False):
         gesture = self.stylus_gesture if is_stylus else self.drag_gesture
@@ -674,15 +702,92 @@ class XNoteCanvas(Gtk.DrawingArea):
                     return "eraser"
             if self.stylus_gesture.get_current_button() in (2, 3):
                 return "eraser"
+        if self.active_tool == "velocity_pen":
+            return "speed"
         return self.active_tool
 
     def _get_stylus_pressure(self):
         ok, pressure = self.stylus_gesture.get_axis(Gdk.AxisUse.PRESSURE)
-        if ok and pressure is not None and pressure > 0.0:
-            return max(0.05, min(1.0, float(pressure)))
-        return 0.65
+        if ok and pressure is not None and pressure >= 0.0:
+            return max(0.0, min(1.0, float(pressure)))
+        return 0.55
 
-    def _begin_interaction(self, wx, wy, pressure=0.65, is_stylus=False):
+    def _build_android_stroke_dict(self, tool_name, px, py, pressure):
+        rgba = [self.pen_rgba[0], self.pen_rgba[1], self.pen_rgba[2], 255]
+        bw = float(self.highlighter_width if tool_name == "highlighter" else self.pen_width)
+
+        if tool_name == "dashed":
+            cfg = {
+                "base_width": bw,
+                "pressure_enabled": False,
+                "pressure_min_factor": 1.0,
+                "direction_strength": 0.0,
+                "rgba": rgba,
+                "dash_length": max(6.0, round(bw * 3.2, 1)),
+                "dash_gap": max(5.0, round(bw * 2.5, 1)),
+            }
+        elif tool_name == "calligraphy":
+            cfg = {
+                "base_width": bw,
+                "pressure_enabled": True,
+                "pressure_min_factor": 0.312,
+                "direction_strength": 0.576,
+                "rgba": rgba,
+            }
+        elif tool_name == "speed":
+            cfg = {
+                "base_width": bw,
+                "pressure_enabled": True,
+                "pressure_min_factor": 0.393,
+                "direction_strength": 0.0,
+                "rgba": rgba,
+                "speed_strength": 0.869,
+            }
+        elif tool_name == "taper":
+            cfg = {
+                "base_width": bw,
+                "pressure_enabled": True,
+                "pressure_min_factor": 0.519,
+                "direction_strength": 0.0,
+                "rgba": rgba,
+                "taper_enabled": True,
+                "taper_min_factor": 0.345,
+            }
+        elif tool_name == "highlighter":
+            cfg = {
+                "base_width": bw,
+                "pressure_enabled": False,
+                "pressure_min_factor": 1.0,
+                "direction_strength": 0.0,
+                "rgba": rgba,
+                "highlighter_alpha": 0.5,
+            }
+        else:  # "pen"
+            cfg = {
+                "base_width": bw,
+                "pressure_enabled": True,
+                "pressure_min_factor": 0.453,
+                "direction_strength": 0.0,
+                "rgba": rgba,
+            }
+
+        first_sample = (
+            [round(px, 2), round(py, 2), round(pressure, 3), 0]
+            if tool_name == "speed"
+            else [round(px, 2), round(py, 2), round(pressure, 3)]
+        )
+        stroke = {
+            "kind": "stroke",
+            "tool": tool_name,
+            "config": cfg,
+            "samples": [first_sample],
+            "smooth_scale": 0.7950984251968506,
+        }
+        if tool_name == "speed":
+            stroke["speed_scale"] = 0.5918616115704284
+        return stroke
+
+    def _begin_interaction(self, wx, wy, pressure=0.55, is_stylus=False):
         page_idx, px, py = self.widget_to_page_coords(wx, wy)
         if page_idx is None:
             self.clear_selection()
@@ -753,26 +858,10 @@ class XNoteCanvas(Gtk.DrawingArea):
             self.queue_draw()
             return
 
-        if self._effective_tool == "highlighter":
-            rgba = [self.pen_rgba[0], self.pen_rgba[1], self.pen_rgba[2], 90]
-            width = self.highlighter_width
-            variable_width = False
-        else:
-            rgba = [self.pen_rgba[0], self.pen_rgba[1], self.pen_rgba[2], 255]
-            width = self.pen_width
-            variable_width = True
-
-        self._active_stroke = {
-            "kind": "stroke",
-            "tool": self._effective_tool,
-            "variable_width": variable_width,
-            "stroke_rgba": rgba,
-            "stroke_width": round(width, 2),
-            "samples": [[round(px, 2), round(py, 2), round(pressure, 3)]]
-        }
+        self._active_stroke = self._build_android_stroke_dict(self._effective_tool, px, py, pressure)
         self.queue_draw()
 
-    def _update_interaction(self, wx, wy, pressure=0.65, is_stylus=False):
+    def _update_interaction(self, wx, wy, pressure=0.55, is_stylus=False):
         if self._active_page_idx is None:
             return
 
@@ -783,6 +872,7 @@ class XNoteCanvas(Gtk.DrawingArea):
             px = max(0.0, min(pw, (wx - offset_x) / self.zoom_level))
             py = max(0.0, min(ph, (wy - offset_y) / self.zoom_level))
 
+        # --- Lasso Freehand Drawing or Lasso Group Transform ---
         if self._effective_tool == "lasso":
             if self._lasso_transform_mode is not None and self._lasso_orig_bbox and self._lasso_orig_items is not None:
                 pages = self.document.get("pages", [])
@@ -801,10 +891,14 @@ class XNoteCanvas(Gtk.DrawingArea):
                             new_s = []
                             for s in orig_s:
                                 if isinstance(s, dict):
-                                    new_s.append([round(s["x"] + dx, 2), round(s["y"] + dy, 2), s.get("pressure", 0.65)])
+                                    new_s.append([round(s["x"] + dx, 2), round(s["y"] + dy, 2), s.get("pressure", 0.5)])
                                 else:
-                                    pr = s[2] if len(s) > 2 else 0.65
-                                    new_s.append([round(s[0] + dx, 2), round(s[1] + dy, 2), pr])
+                                    pt = [round(s[0] + dx, 2), round(s[1] + dy, 2)]
+                                    if len(s) > 2:
+                                        pt.append(s[2])
+                                    if len(s) > 3:
+                                        pt.append(s[3])
+                                    new_s.append(pt)
                             cur_it["samples"] = new_s
                         elif kind == "text":
                             opos = orig_it.get("pos", [0.0, 0.0])
@@ -835,7 +929,7 @@ class XNoteCanvas(Gtk.DrawingArea):
                         nw = max(min_s, px - ax)
                         nh = max(min_s, ay - py)
                         nx, ny = ax, ay - nh
-                    else:  # "sw"
+                    else:
                         ax, ay = obx + obw, oby
                         nw = max(min_s, ax - px)
                         nh = max(min_s, py - ay)
@@ -863,12 +957,16 @@ class XNoteCanvas(Gtk.DrawingArea):
                             for s in orig_s:
                                 ox_pt = float(s["x"]) if isinstance(s, dict) else float(s[0])
                                 oy_pt = float(s["y"]) if isinstance(s, dict) else float(s[1])
-                                pr = s.get("pressure", 0.65) if isinstance(s, dict) else (s[2] if len(s) > 2 else 0.65)
-                                new_s.append([
+                                pt = [
                                     round(nx + (ox_pt - obx) * sx, 2),
                                     round(ny + (oy_pt - oby) * sy, 2),
-                                    pr
-                                ])
+                                ]
+                                if not isinstance(s, dict):
+                                    if len(s) > 2:
+                                        pt.append(s[2])
+                                    if len(s) > 3:
+                                        pt.append(s[3])
+                                new_s.append(pt)
                             cur_it["samples"] = new_s
                         elif kind == "text":
                             opos = orig_it.get("pos", [0.0, 0.0])
@@ -897,6 +995,7 @@ class XNoteCanvas(Gtk.DrawingArea):
                     self.queue_draw()
             return
 
+        # --- Single Image Transform ---
         if self._effective_tool == "select" and self._transform_mode is not None:
             item = self.get_selected_item()
             if not item or not self._transform_orig_rect:
@@ -984,35 +1083,25 @@ class XNoteCanvas(Gtk.DrawingArea):
             self.queue_draw()
             return
 
+        # --- Active Brush Stroke ---
         if self._active_stroke is not None:
             samples = self._active_stroke["samples"]
             last = samples[-1]
             raw_dist = math.hypot(px - self._last_raw_pt[0], py - self._last_raw_pt[1])
             now = time.perf_counter()
-            dt = max(1e-4, now - self._last_sample_time)
+            dt_sec = max(1e-4, now - self._last_sample_time)
+            dt_ms = max(1, int(round(dt_sec * 1000.0)))
 
-            if raw_dist >= 1.0:
-                smooth_x = 0.62 * px + 0.38 * last[0]
-                smooth_y = 0.62 * py + 0.38 * last[1]
-                velocity_px_ms = (raw_dist / dt) / 1000.0
+            if raw_dist >= 0.8:
+                smooth_x = 0.65 * px + 0.35 * last[0]
+                smooth_y = 0.65 * py + 0.35 * last[1]
+                self._smoothed_pressure = 0.6 * self._smoothed_pressure + 0.4 * pressure
 
-                if self._effective_tool == "velocity_pen":
-                    vel_factor = 1.0 / (1.0 + 0.38 * (velocity_px_ms ** 1.15))
-                    vel_pressure = max(0.12, min(1.0, 0.12 + 0.88 * vel_factor))
-                    if is_stylus:
-                        target_p = 0.35 * pressure + 0.65 * vel_pressure
-                    else:
-                        target_p = vel_pressure
-                    alpha_p = 0.32
+                if self._effective_tool == "speed":
+                    samples.append([round(smooth_x, 2), round(smooth_y, 2), round(self._smoothed_pressure, 3), dt_ms])
                 else:
-                    if not is_stylus:
-                        target_p = max(0.24, min(0.95, 0.85 - (velocity_px_ms / 4.2) * 0.45))
-                    else:
-                        target_p = pressure
-                    alpha_p = 0.42
+                    samples.append([round(smooth_x, 2), round(smooth_y, 2), round(self._smoothed_pressure, 3)])
 
-                self._smoothed_pressure = (1.0 - alpha_p) * self._smoothed_pressure + alpha_p * target_p
-                samples.append([round(smooth_x, 2), round(smooth_y, 2), round(self._smoothed_pressure, 3)])
                 self._last_sample_time = now
                 self._last_raw_pt = (px, py)
                 self.queue_draw()
@@ -1113,11 +1202,10 @@ class XNoteCanvas(Gtk.DrawingArea):
             raw_samples = self._active_stroke["samples"]
             if len(raw_samples) == 1:
                 s0 = raw_samples[0]
-                p0 = s0[2] if len(s0) > 2 else 0.65
-                raw_samples.append([round(s0[0] + 0.4, 2), round(s0[1] + 0.4, 2), p0])
-            elif len(raw_samples) >= 3:
-                self._active_stroke["samples"] = self.smooth_samples_chaikin(raw_samples, iterations=2)
-                self._active_stroke["smoothed"] = True
+                if len(s0) >= 4:
+                    raw_samples.append([round(s0[0] + 0.4, 2), round(s0[1] + 0.4, 2), s0[2], 5])
+                else:
+                    raw_samples.append([round(s0[0] + 0.4, 2), round(s0[1] + 0.4, 2), s0[2]])
 
             page.setdefault("items", []).append(self._active_stroke)
             self._record_undo_step(
@@ -1145,7 +1233,7 @@ class XNoteCanvas(Gtk.DrawingArea):
             for elem in axes_backlog:
                 if hasattr(elem, "axes") and len(elem.axes) >= 2:
                     bx, by = elem.axes[0], elem.axes[1]
-                    bp = elem.axes[2] if len(elem.axes) > 2 and elem.axes[2] > 0 else self._get_stylus_pressure()
+                    bp = elem.axes[2] if len(elem.axes) > 2 and elem.axes[2] >= 0 else self._get_stylus_pressure()
                     if bx and by:
                         self._update_interaction(bx, by, pressure=bp, is_stylus=True)
         pressure = self._get_stylus_pressure()
@@ -1160,14 +1248,14 @@ class XNoteCanvas(Gtk.DrawingArea):
     def _on_drag_begin(self, gesture, start_x, start_y):
         if self._stylus_active:
             return
-        self._begin_interaction(start_x, start_y, pressure=0.65, is_stylus=False)
+        self._begin_interaction(start_x, start_y, pressure=0.55, is_stylus=False)
 
     def _on_drag_update(self, gesture, offset_x, offset_y):
         if self._stylus_active or self._active_page_idx is None:
             return
         ok, start_x, start_y = gesture.get_start_point()
         if ok:
-            self._update_interaction(start_x + offset_x, start_y + offset_y, pressure=0.65, is_stylus=False)
+            self._update_interaction(start_x + offset_x, start_y + offset_y, pressure=0.55, is_stylus=False)
 
     def _on_drag_end(self, gesture, offset_x, offset_y):
         if self._stylus_active:
@@ -1207,7 +1295,7 @@ class XNoteCanvas(Gtk.DrawingArea):
             hit = False
             if kind == "stroke":
                 samples = item.get("samples") or item.get("points") or []
-                half_w = float(item.get("stroke_width", 3.0)) / 2.0
+                half_w = self._get_stroke_base_width(item) / 2.0
                 threshold = radius + half_w
                 for i in range(len(samples)):
                     s1 = samples[i]
@@ -1293,15 +1381,151 @@ class XNoteCanvas(Gtk.DrawingArea):
         entry.grab_focus()
 
     # =========================================================================
-    # Cairo Rendering & Subtle Page Framing
+    # xtemplate v1 Expression, Color & SVG Path Evaluators (Checklist & Cover)
     # =========================================================================
     def _rounded_rect(self, cr, x, y, w, h, r):
+        r = max(0.0, min(r, min(w, h) / 2.0))
+        if r <= 1e-3:
+            cr.rectangle(x, y, w, h)
+            return
         cr.new_sub_path()
         cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
         cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
         cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
         cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
         cr.close_path()
+
+    @classmethod
+    def _eval_xtemplate_expr(cls, expr, dpi, total, box_w, box_h, params):
+        """Evaluate xtemplate v1 arithmetic/unit expressions including W, H, min(), max()."""
+        if expr is None:
+            return 0.0
+        if isinstance(expr, (int, float)):
+            return float(expr)
+        if not isinstance(expr, str):
+            return 0.0
+
+        s = expr.strip()
+        if not s:
+            return 0.0
+
+        # Parameter name lookup
+        if params and s in params:
+            pval = params[s]
+            if isinstance(pval, dict):
+                pval = pval.get("value", pval.get("default", 0.0))
+            return cls._eval_xtemplate_expr(pval, dpi, total, box_w, box_h, params)
+
+        # Direct physical unit or percentage
+        if s.endswith('%') or re.match(r'^[+-]?\d+(?:\.\d+)?\s*(mm|cm|in|pt|px)?$', s, re.IGNORECASE):
+            return XTemplateEvaluator.eval_length(s, dpi, total, params)
+
+        # Replace parameter identifiers and physical units inside formula expressions
+        def replace_unit(m):
+            val = float(m.group(1))
+            unit = m.group(2).lower()
+            if unit == 'mm':
+                return str(val * (dpi / 25.4))
+            elif unit == 'cm':
+                return str(val * (dpi / 2.54))
+            elif unit == 'in':
+                return str(val * dpi)
+            elif unit == 'pt':
+                return str(val * (dpi / 72.0))
+            elif unit == '%':
+                return str((val / 100.0) * total)
+            return str(val)
+
+        s_eval = re.sub(r'(\d+(?:\.\d+)?)\s*(mm|cm|in|pt|px|%)', replace_unit, s)
+        env = {"W": float(box_w), "H": float(box_h), "min": min, "max": max, "abs": abs, "round": round}
+        if params:
+            for k, v in params.items():
+                raw_v = v.get("value", v.get("default", 0.0)) if isinstance(v, dict) else v
+                if isinstance(raw_v, (int, float)):
+                    env[k] = float(raw_v)
+                elif isinstance(raw_v, str):
+                    env[k] = XTemplateEvaluator.eval_length(raw_v, dpi, total, None)
+        try:
+            return float(eval(s_eval, {"__builtins__": {}}, env))
+        except Exception:
+            return XTemplateEvaluator.eval_length(s, dpi, total, params)
+
+    @classmethod
+    def _resolve_xtemplate_color(cls, col_spec, params, pattern_rgba, accent_rgba):
+        if not col_spec or col_spec == "none":
+            return None
+        if col_spec == "accent":
+            return accent_rgba
+        if col_spec in ("primary", "pattern"):
+            return pattern_rgba
+        if params and col_spec in params:
+            p = params[col_spec]
+            if isinstance(p, dict):
+                col_spec = p.get("value", p.get("default", col_spec))
+            else:
+                col_spec = p
+        if isinstance(col_spec, (list, tuple)) and len(col_spec) >= 3:
+            a = col_spec[3] / 255.0 if len(col_spec) >= 4 else 1.0
+            return (col_spec[0] / 255.0, col_spec[1] / 255.0, col_spec[2] / 255.0, a)
+        if isinstance(col_spec, str):
+            hx = col_spec.strip().lstrip('#')
+            if len(hx) == 6:
+                return (int(hx[0:2], 16) / 255.0, int(hx[2:4], 16) / 255.0, int(hx[4:6], 16) / 255.0, 1.0)
+            elif len(hx) == 8:
+                return (
+                    int(hx[0:2], 16) / 255.0,
+                    int(hx[2:4], 16) / 255.0,
+                    int(hx[4:6], 16) / 255.0,
+                    int(hx[6:8], 16) / 255.0
+                )
+        return pattern_rgba
+
+    @staticmethod
+    def _draw_svg_path_d(cr, d_str):
+        """Render SVG path commands (M, L, H, V, A, Z) used in xtemplate bookplates/shapes."""
+        tokens = re.findall(r'[MLHVAZmlhvaz]|[-+]?\d*\.?\d+', d_str)
+        idx = 0
+        cx, cy = 0.0, 0.0
+        sx, sy = 0.0, 0.0
+        cr.new_path()
+
+        while idx < len(tokens):
+            cmd = tokens[idx]
+            idx += 1
+            if cmd == 'M':
+                cx, cy = float(tokens[idx]), float(tokens[idx + 1])
+                sx, sy = cx, cy
+                cr.move_to(cx, cy)
+                idx += 2
+            elif cmd == 'L':
+                cx, cy = float(tokens[idx]), float(tokens[idx + 1])
+                cr.line_to(cx, cy)
+                idx += 2
+            elif cmd == 'H':
+                cx = float(tokens[idx])
+                cr.line_to(cx, cy)
+                idx += 1
+            elif cmd == 'V':
+                cy = float(tokens[idx])
+                cr.line_to(cx, cy)
+                idx += 1
+            elif cmd == 'A':
+                # A rx ry x-axis-rotation large-arc-flag sweep-flag x y
+                rx = float(tokens[idx])
+                ry = float(tokens[idx + 1])
+                x_end = float(tokens[idx + 5])
+                y_end = float(tokens[idx + 6])
+                idx += 7
+                # Smoothly approximate quarter/rounded corner arcs with a cubic Bezier
+                cpx1 = cx + (x_end - cx) * 0.55
+                cpy1 = cy
+                cpx2 = x_end
+                cpy2 = cy + (y_end - cy) * 0.45
+                cr.curve_to(cpx1, cpy1, cpx2, cpy2, x_end, y_end)
+                cx, cy = x_end, y_end
+            elif cmd in ('Z', 'z'):
+                cr.close_path()
+                cx, cy = sx, sy
 
     def _draw_xtemplate_items(self, cr, items, box_x, box_y, box_w, box_h, dpi, params, pattern_rgba, accent_rgba, t_info, assets, templates):
         for item in items:
@@ -1314,6 +1538,8 @@ class XNoteCanvas(Gtk.DrawingArea):
                 surf = None
                 if t_info and src in t_info.get("images", {}):
                     surf = t_info["images"][src]
+                elif t_info and os.path.basename(str(src)) in t_info.get("images", {}):
+                    surf = t_info["images"][os.path.basename(str(src))]
                 elif t_info and t_info.get("surface") is not None:
                     surf = t_info["surface"]
                 else:
@@ -1345,78 +1571,219 @@ class XNoteCanvas(Gtk.DrawingArea):
                     cr.paint()
                     cr.restore()
 
+            elif itype == "rect":
+                rx_pos = box_x + self._eval_xtemplate_expr(item.get("x", 0), dpi, box_w, box_w, box_h, params)
+                ry_pos = box_y + self._eval_xtemplate_expr(item.get("y", 0), dpi, box_h, box_w, box_h, params)
+                rw = (
+                    self._eval_xtemplate_expr(item["w"], dpi, box_w, box_w, box_h, params)
+                    if "w" in item else box_w
+                )
+                rh = (
+                    self._eval_xtemplate_expr(item["h"], dpi, box_h, box_w, box_h, params)
+                    if "h" in item else box_h
+                )
+                corner_r = self._eval_xtemplate_expr(item.get("rx", item.get("ry", 0)), dpi, min(rw, rh), box_w, box_h, params)
+                fill_spec = item.get("fill", "none")
+                stroke_spec = item.get("stroke", "primary")
+                lw = self._eval_xtemplate_expr(item.get("strokeWidth", item.get("width", 1.5)), dpi, box_w, box_w, box_h, params)
+
+                cr.save()
+                self._rounded_rect(cr, rx_pos, ry_pos, rw, rh, corner_r)
+                if fill_spec and fill_spec != "none":
+                    fill_rgba = self._resolve_xtemplate_color(fill_spec, params, pattern_rgba, accent_rgba)
+                    if fill_rgba:
+                        cr.set_source_rgba(*fill_rgba)
+                        if stroke_spec and stroke_spec != "none":
+                            cr.fill_preserve()
+                        else:
+                            cr.fill()
+                if stroke_spec and stroke_spec != "none":
+                    s_rgba = self._resolve_xtemplate_color(stroke_spec, params, pattern_rgba, accent_rgba)
+                    if s_rgba:
+                        cr.set_source_rgba(*s_rgba)
+                        cr.set_line_width(lw)
+                        cr.stroke()
+                cr.restore()
+
+            elif itype == "text":
+                txt = str(item.get("text", ""))
+                if txt:
+                    tx = box_x + self._eval_xtemplate_expr(item.get("x", 0), dpi, box_w, box_w, box_h, params)
+                    ty = box_y + self._eval_xtemplate_expr(item.get("y", 0), dpi, box_h, box_w, box_h, params)
+                    fsize = self._eval_xtemplate_expr(item.get("size", "4.5mm"), dpi, box_h, box_w, box_h, params)
+                    weight = item.get("weight", "normal")
+                    col_rgba = self._resolve_xtemplate_color(item.get("fill", item.get("color", "primary")), params, pattern_rgba, accent_rgba)
+
+                    layout = PangoCairo.create_layout(cr)
+                    layout.set_text(txt, -1)
+                    weight_str = "Bold" if str(weight).lower() == "bold" else ""
+                    font_desc = Pango.FontDescription.from_string(f"Sans {weight_str} {max(6.0, fsize)}px")
+                    layout.set_font_description(font_desc)
+                    _, logical = layout.get_pixel_extents()
+
+                    cr.save()
+                    if col_rgba:
+                        cr.set_source_rgba(*col_rgba)
+                    # Position baseline/top naturally around ty
+                    cr.move_to(tx, ty - logical.height * 0.75)
+                    PangoCairo.show_layout(cr, layout)
+                    cr.restore()
+
+            elif itype == "path":
+                d_str = item.get("d", "")
+                vb = item.get("viewBox", "0 0 100 100")
+                vb_parts = [float(v) for v in re.findall(r'[-+]?\d*\.?\d+', str(vb))]
+                vb_w = vb_parts[2] if len(vb_parts) >= 4 else box_w
+                vb_h = vb_parts[3] if len(vb_parts) >= 4 else box_h
+                px_off = self._eval_xtemplate_expr(item.get("x", 0), dpi, box_w, box_w, box_h, params)
+                py_off = self._eval_xtemplate_expr(item.get("y", 0), dpi, box_h, box_w, box_h, params)
+
+                if d_str and vb_w > 0 and vb_h > 0:
+                    cr.save()
+                    cr.translate(box_x + px_off, box_y + py_off)
+                    sx = box_w / vb_w
+                    sy = box_h / vb_h
+                    cr.scale(sx, sy)
+                    self._draw_svg_path_d(cr, d_str)
+
+                    fill_spec = item.get("fill")
+                    if fill_spec and fill_spec != "none":
+                        f_rgba = self._resolve_xtemplate_color(fill_spec, params, pattern_rgba, accent_rgba)
+                        if f_rgba:
+                            cr.set_source_rgba(*f_rgba)
+                            if item.get("stroke") and item.get("stroke") != "none":
+                                cr.fill_preserve()
+                            else:
+                                cr.fill()
+
+                    stroke_spec = item.get("stroke")
+                    if stroke_spec and stroke_spec != "none":
+                        s_rgba = self._resolve_xtemplate_color(stroke_spec, params, pattern_rgba, accent_rgba)
+                        if s_rgba:
+                            lw = self._eval_xtemplate_expr(item.get("strokeWidth", 1.5), dpi, box_w, box_w, box_h, params)
+                            cr.set_source_rgba(*s_rgba)
+                            cr.set_line_width(lw / max(0.1, (sx + sy) * 0.5))
+                            cr.stroke()
+                    cr.restore()
+
             elif itype == "group":
-                gx = box_x + XTemplateEvaluator.eval_length(item.get("x", 0), dpi, box_w, params)
-                gy = box_y + XTemplateEvaluator.eval_length(item.get("y", 0), dpi, box_h, params)
-                gw = (
-                    XTemplateEvaluator.eval_length(item["w"], dpi, box_w, params)
-                    if "w" in item else (box_x + box_w - gx)
-                )
-                gh = (
-                    XTemplateEvaluator.eval_length(item["h"], dpi, box_h, params)
-                    if "h" in item else (box_y + box_h - gy)
-                )
-                children = item.get("children", [])
-                if children and gw > 0 and gh > 0:
-                    self._draw_xtemplate_items(
-                        cr, children, gx, gy, gw, gh, dpi, params, pattern_rgba, accent_rgba, t_info, assets, templates
+                inset = item.get("inset")
+                if isinstance(inset, (list, tuple)) and len(inset) >= 4:
+                    # [top, right, bottom, left]
+                    itop = self._eval_xtemplate_expr(inset[0], dpi, box_h, box_w, box_h, params)
+                    iright = self._eval_xtemplate_expr(inset[1], dpi, box_w, box_w, box_h, params)
+                    ibottom = self._eval_xtemplate_expr(inset[2], dpi, box_h, box_w, box_h, params)
+                    ileft = self._eval_xtemplate_expr(inset[3], dpi, box_w, box_w, box_h, params)
+                    gx = box_x + ileft
+                    gy = box_y + itop
+                    gw = max(0.0, box_w - ileft - iright)
+                    gh = max(0.0, box_h - itop - ibottom)
+                else:
+                    gx = box_x + self._eval_xtemplate_expr(item.get("x", 0), dpi, box_w, box_w, box_h, params)
+                    gy = box_y + self._eval_xtemplate_expr(item.get("y", 0), dpi, box_h, box_w, box_h, params)
+                    gw = (
+                        self._eval_xtemplate_expr(item["w"], dpi, box_w, box_w, box_h, params)
+                        if "w" in item else (box_x + box_w - gx)
                     )
+                    gh = (
+                        self._eval_xtemplate_expr(item["h"], dpi, box_h, box_w, box_h, params)
+                        if "h" in item else (box_y + box_h - gy)
+                    )
+
+                opacity = 1.0
+                if "opacity" in item:
+                    opacity = max(0.0, min(1.0, self._eval_xtemplate_expr(item["opacity"], dpi, 1.0, box_w, box_h, params)))
+
+                children = item.get("children", [])
+                if children and gw > 0 and gh > 0 and opacity > 0.01:
+                    if opacity < 0.99:
+                        cr.save()
+                        cr.push_group()
+                        self._draw_xtemplate_items(
+                            cr, children, gx, gy, gw, gh, dpi, params, pattern_rgba, accent_rgba, t_info, assets, templates
+                        )
+                        cr.pop_group_to_source()
+                        cr.paint_with_alpha(opacity)
+                        cr.restore()
+                    else:
+                        self._draw_xtemplate_items(
+                            cr, children, gx, gy, gw, gh, dpi, params, pattern_rgba, accent_rgba, t_info, assets, templates
+                        )
 
             elif itype == "repeat":
                 axis = item.get("axis", "y").lower()
                 total_len = box_h if axis == "y" else box_w
-                period = XTemplateEvaluator.eval_length(item.get("period", "8mm"), dpi, total_len, params)
+                period = self._eval_xtemplate_expr(item.get("period", "8mm"), dpi, total_len, box_w, box_h, params)
+                fit_mode = item.get("fit")
                 children = item.get("children", [])
                 if period > 0.5 and children:
-                    offset = 0.0
-                    while offset <= total_len + 0.5:
-                        if axis == "y":
-                            self._draw_xtemplate_items(
-                                cr, children, box_x, box_y + offset, box_w, min(period, box_h - offset),
-                                dpi, params, pattern_rgba, accent_rgba, t_info, assets, templates
-                            )
-                        else:
-                            self._draw_xtemplate_items(
-                                cr, children, box_x + offset, box_y, min(period, box_w - offset), box_h,
-                                dpi, params, pattern_rgba, accent_rgba, t_info, assets, templates
-                            )
-                        offset += period
+                    if fit_mode == "round":
+                        count = max(1, int(round(total_len / period)))
+                        step_period = total_len / count
+                        for i in range(count):
+                            offset = i * step_period
+                            if axis == "y":
+                                self._draw_xtemplate_items(
+                                    cr, children, box_x, box_y + offset, box_w, step_period,
+                                    dpi, params, pattern_rgba, accent_rgba, t_info, assets, templates
+                                )
+                            else:
+                                self._draw_xtemplate_items(
+                                    cr, children, box_x + offset, box_y, step_period, box_h,
+                                    dpi, params, pattern_rgba, accent_rgba, t_info, assets, templates
+                                )
+                    else:
+                        offset = 0.0
+                        while offset <= total_len + 0.5:
+                            if axis == "y":
+                                self._draw_xtemplate_items(
+                                    cr, children, box_x, box_y + offset, box_w, min(period, box_h - offset),
+                                    dpi, params, pattern_rgba, accent_rgba, t_info, assets, templates
+                                )
+                            else:
+                                self._draw_xtemplate_items(
+                                    cr, children, box_x + offset, box_y, min(period, box_w - offset), box_h,
+                                    dpi, params, pattern_rgba, accent_rgba, t_info, assets, templates
+                                )
+                            offset += period
 
             elif itype == "hline":
-                ly = box_y + XTemplateEvaluator.eval_length(item.get("y", 0), dpi, box_h, params)
-                x1 = box_x + XTemplateEvaluator.eval_length(item.get("x1", 0), dpi, box_w, params)
+                ly = box_y + self._eval_xtemplate_expr(item.get("y", 0), dpi, box_h, box_w, box_h, params)
+                x1 = box_x + self._eval_xtemplate_expr(item.get("x1", 0), dpi, box_w, box_w, box_h, params)
                 x2 = (
-                    box_x + XTemplateEvaluator.eval_length(item["x2"], dpi, box_w, params)
+                    box_x + self._eval_xtemplate_expr(item["x2"], dpi, box_w, box_w, box_h, params)
                     if "x2" in item else (box_x + box_w)
                 )
                 stroke_role = item.get("stroke", "primary")
-                rgba = accent_rgba if stroke_role == "accent" else pattern_rgba
+                rgba = self._resolve_xtemplate_color(stroke_role, params, pattern_rgba, accent_rgba)
                 lw = float(item.get("width", 1.25))
-                cr.save()
-                cr.set_source_rgba(*rgba)
-                cr.set_line_width(lw)
-                cr.move_to(x1, ly)
-                cr.line_to(x2, ly)
-                cr.stroke()
-                cr.restore()
+                if rgba:
+                    cr.save()
+                    cr.set_source_rgba(*rgba)
+                    cr.set_line_width(lw)
+                    cr.move_to(x1, ly)
+                    cr.line_to(x2, ly)
+                    cr.stroke()
+                    cr.restore()
 
             elif itype == "vline":
-                lx = box_x + XTemplateEvaluator.eval_length(item.get("x", 0), dpi, box_w, params)
-                y1 = box_y + XTemplateEvaluator.eval_length(item.get("y1", 0), dpi, box_h, params)
+                lx = box_x + self._eval_xtemplate_expr(item.get("x", 0), dpi, box_w, box_w, box_h, params)
+                y1 = box_y + self._eval_xtemplate_expr(item.get("y1", 0), dpi, box_h, box_w, box_h, params)
                 y2 = (
-                    box_y + XTemplateEvaluator.eval_length(item["y2"], dpi, box_h, params)
+                    box_y + self._eval_xtemplate_expr(item["y2"], dpi, box_h, box_w, box_h, params)
                     if "y2" in item else (box_y + box_h)
                 )
                 stroke_role = item.get("stroke", "primary")
-                rgba = accent_rgba if stroke_role == "accent" else pattern_rgba
+                rgba = self._resolve_xtemplate_color(stroke_role, params, pattern_rgba, accent_rgba)
                 lw = float(item.get("width", 1.5))
-                cr.save()
-                cr.set_source_rgba(*rgba)
-                cr.set_line_width(lw)
-                cr.move_to(lx, y1)
-                cr.line_to(lx, y2)
-                cr.stroke()
-                cr.restore()
+                if rgba:
+                    cr.save()
+                    cr.set_source_rgba(*rgba)
+                    cr.set_line_width(lw)
+                    cr.move_to(lx, y1)
+                    cr.line_to(lx, y2)
+                    cr.stroke()
+                    cr.restore()
 
     def render_page_contents(self, cr, doc, page, pw, ph, assets, templates, page_idx=0):
         dpi = float(doc.get("dpi", 150.0))
@@ -1479,13 +1846,21 @@ class XNoteCanvas(Gtk.DrawingArea):
         if t_info is not None:
             t_meta = t_info.get("meta", {}) if isinstance(t_info.get("meta"), dict) else {}
             t_items = t_meta.get("items", [])
-            t_params = dict(t_meta.get("params", {}))
+            t_params = copy.deepcopy(t_meta.get("params", {}))
             for k, v in doc_style.items():
                 if k in t_params:
                     t_params[k] = v
+                elif k == "spacing":
+                    for pk, pv in list(t_params.items()):
+                        if isinstance(pv, dict) and pv.get("role") == "spacing":
+                            t_params[pk] = v
             for k, v in style.items():
                 if k in t_params:
                     t_params[k] = v
+                elif k == "spacing":
+                    for pk, pv in list(t_params.items()):
+                        if isinstance(pv, dict) and pv.get("role") == "spacing":
+                            t_params[pk] = v
 
             if t_items:
                 self._draw_xtemplate_items(
@@ -1577,8 +1952,8 @@ class XNoteCanvas(Gtk.DrawingArea):
 
         self.render_page_contents(cr, doc, page, pw, ph, assets, templates, page_idx=page_idx)
 
-        cr.set_source_rgba(0, 0, 0, 0.16)
-        cr.set_line_width(2.5 / scale)
+        cr.set_source_rgba(0, 0, 0, 0.18)
+        cr.set_line_width(3.0 / scale)
         self._rounded_rect(cr, 0, 0, pw, ph, radius)
         cr.stroke()
         cr.restore()
@@ -1701,15 +2076,11 @@ class XNoteCanvas(Gtk.DrawingArea):
         scaled_h = ph * self.zoom_level
         rx = round(offset_x)
         ry = round(offset_y)
-        rw = round(scaled_w)
-        rh = round(scaled_h)
 
-        # Draw cached page contents
         surface = self._get_cached_page_surface(page_idx, page, pw, ph)
         cr.set_source_surface(surface, rx, ry)
         cr.paint()
 
-        # Draw live in-progress stroke
         if self._active_stroke is not None and self._active_page_idx == page_idx:
             cr.save()
             cr.translate(offset_x, offset_y)
@@ -1719,11 +2090,11 @@ class XNoteCanvas(Gtk.DrawingArea):
             self.draw_stroke(cr, self._active_stroke)
             cr.restore()
 
-        # Crisp, subtle 1px border framing the page
+        # Subtle 1px border around the page instead of a grey background or drop shadow
         cr.save()
-        cr.set_source_rgba(0.0, 0.0, 0.0, 0.14)
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.16)
         cr.set_line_width(1.0)
-        cr.rectangle(rx + 0.5, ry + 0.5, rw - 1.0, rh - 1.0)
+        cr.rectangle(rx + 0.5, ry + 0.5, round(scaled_w) - 1.0, round(scaled_h) - 1.0)
         cr.stroke()
         cr.restore()
 
@@ -1735,7 +2106,6 @@ class XNoteCanvas(Gtk.DrawingArea):
         self._draw_lasso_overlay(cr, offset_x, offset_y, page_idx)
 
     def on_draw(self, drawing_area, cr, width, height):
-        # No grey surround fill — let the clean window/view background show through
         if not self.document:
             return
 
@@ -1862,6 +2232,10 @@ class XNoteCanvas(Gtk.DrawingArea):
         cr.move_to(x, y)
         PangoCairo.show_layout(cr, layout)
 
+    # =========================================================================
+    # Android .xnote & Desktop Stroke Renderer
+    # (pen, dashed, calligraphy, speed, taper, highlighter)
+    # =========================================================================
     @staticmethod
     def _fill_variable_capsule(cr, x0, y0, r0, x1, y1, r1):
         dx = x1 - x0
@@ -1893,32 +2267,38 @@ class XNoteCanvas(Gtk.DrawingArea):
         if not raw_samples:
             return
 
-        if not stroke.get("smoothed", False) and len(raw_samples) >= 3:
+        tool = stroke.get("tool", "pen")
+        cfg = stroke.get("config") if isinstance(stroke.get("config"), dict) else {}
+
+        # 1. Extract RGBA & Alpha (supporting both Android config.rgba and legacy stroke_rgba)
+        rgba = cfg.get("rgba") or stroke.get("stroke_rgba") or stroke.get("color") or [0, 0, 0, 255]
+        r = rgba[0] / 255.0
+        g = rgba[1] / 255.0
+        b = rgba[2] / 255.0
+        a = rgba[3] / 255.0 if len(rgba) >= 4 else 1.0
+        if "highlighter_alpha" in cfg:
+            a = float(cfg["highlighter_alpha"])
+        elif tool == "highlighter" and a > 0.9:
+            a = 0.5
+
+        base_width = float(cfg.get("base_width", stroke.get("stroke_width", stroke.get("width", 3.2))))
+
+        # 2. Smooth sample coordinates
+        if len(raw_samples) >= 3 and tool != "dashed":
             samples = self.smooth_samples_chaikin(raw_samples, iterations=1)
         else:
             samples = raw_samples
 
-        rgba = stroke.get("stroke_rgba", stroke.get("color", [0, 0, 0, 255]))
-        r, g, b, a = rgba[0] / 255.0, rgba[1] / 255.0, rgba[2] / 255.0, rgba[3] / 255.0
-        base_width = float(stroke.get("stroke_width", stroke.get("width", 3.2)))
-        tool = stroke.get("tool", "pen")
-
-        first_s = samples[0]
-        has_pressure = (
-            stroke.get("variable_width", False)
-            or tool in ("calligraphy", "velocity_pen")
-            or (isinstance(first_s, (list, tuple)) and len(first_s) >= 3)
-            or (isinstance(first_s, dict) and "pressure" in first_s)
-        )
-
-        if not has_pressure or tool == "highlighter":
+        # 3. Dashed Line Tool ("dashed")
+        if tool == "dashed" or "dash_length" in cfg:
+            dash_len = float(cfg.get("dash_length", 10.0))
+            dash_gap = float(cfg.get("dash_gap", 8.0))
             cr.save()
-            if tool == "highlighter" or a < 0.95:
-                cr.set_operator(cairo.OPERATOR_MULTIPLY if a < 0.6 else cairo.OPERATOR_OVER)
             cr.set_source_rgba(r, g, b, a)
             cr.set_line_width(base_width)
             cr.set_line_join(cairo.LINE_JOIN_ROUND)
             cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            cr.set_dash([dash_len, dash_gap])
 
             cr.new_path()
             for idx, sample in enumerate(samples):
@@ -1932,53 +2312,134 @@ class XNoteCanvas(Gtk.DrawingArea):
             cr.restore()
             return
 
+        # 4. Highlighter or Uniform-Width Stroke
+        pressure_enabled = bool(cfg.get("pressure_enabled", True))
+        direction_strength = float(cfg.get("direction_strength", 0.576 if tool == "calligraphy" else 0.0))
+        speed_strength = float(cfg.get("speed_strength", 0.869 if tool in ("speed", "velocity_pen") else 0.0))
+        taper_enabled = bool(cfg.get("taper_enabled", tool == "taper"))
+
+        if tool == "highlighter" or (
+            not pressure_enabled
+            and direction_strength <= 0.0
+            and speed_strength <= 0.0
+            and not taper_enabled
+        ):
+            cr.save()
+            if a < 0.99:
+                cr.push_group()
+                cr.set_source_rgb(r, g, b)
+                cr.set_line_width(base_width)
+                cr.set_line_join(cairo.LINE_JOIN_ROUND)
+                cr.set_line_cap(cairo.LINE_CAP_ROUND)
+                cr.new_path()
+                for idx, sample in enumerate(samples):
+                    x = float(sample["x"]) if isinstance(sample, dict) else float(sample[0])
+                    y = float(sample["y"]) if isinstance(sample, dict) else float(sample[1])
+                    if idx == 0:
+                        cr.move_to(x, y)
+                    else:
+                        cr.line_to(x, y)
+                cr.stroke()
+                cr.pop_group_to_source()
+                cr.paint_with_alpha(a)
+            else:
+                cr.set_source_rgb(r, g, b)
+                cr.set_line_width(base_width)
+                cr.set_line_join(cairo.LINE_JOIN_ROUND)
+                cr.set_line_cap(cairo.LINE_CAP_ROUND)
+                cr.new_path()
+                for idx, sample in enumerate(samples):
+                    x = float(sample["x"]) if isinstance(sample, dict) else float(sample[0])
+                    y = float(sample["y"]) if isinstance(sample, dict) else float(sample[1])
+                    if idx == 0:
+                        cr.move_to(x, y)
+                    else:
+                        cr.line_to(x, y)
+                cr.stroke()
+            cr.restore()
+            return
+
+        # 5. Variable-Width Stroke Engine (pen, calligraphy, speed, taper)
+        pressure_min = float(cfg.get("pressure_min_factor", 0.45))
+        taper_min = float(cfg.get("taper_min_factor", 0.345))
+        speed_scale = float(stroke.get("speed_scale", 0.592))
+
         pts = []
-        for s in samples:
+        cum_lengths = [0.0]
+        for idx, s in enumerate(samples):
             if isinstance(s, dict):
                 px = float(s.get("x", 0.0))
                 py = float(s.get("y", 0.0))
-                pr = float(s.get("pressure", 0.65))
+                pr = float(s.get("pressure", 0.5))
+                dt = float(s.get("dt", 8.0))
             else:
                 px = float(s[0]) if len(s) > 0 else 0.0
                 py = float(s[1]) if len(s) > 1 else 0.0
-                pr = float(s[2]) if len(s) > 2 else 0.65
-            pts.append((px, py, max(0.05, min(1.0, pr))))
+                pr = float(s[2]) if len(s) > 2 else 0.5
+                dt = float(s[3]) if len(s) > 3 else 8.0
+            pts.append((px, py, max(0.0, min(1.0, pr)), max(1.0, dt)))
+            if idx > 0:
+                seg_d = math.hypot(px - pts[idx - 1][0], py - pts[idx - 1][1])
+                cum_lengths.append(cum_lengths[-1] + seg_d)
 
+        total_len = cum_lengths[-1]
+        base_r = max(0.35, base_width / 2.0)
         radii = []
-        base_r = max(0.4, base_width / 2.0)
-        is_calligraphy_nib = (tool == "calligraphy")
-        is_velocity_pen = (tool == "velocity_pen")
 
-        for i, (px, py, pr) in enumerate(pts):
-            if is_velocity_pen:
-                p_factor = 0.14 + 1.30 * (pr ** 1.45)
+        for i, (px, py, pr, dt) in enumerate(pts):
+            # A. Pressure factor
+            if pressure_enabled:
+                p_factor = pressure_min + (1.0 - pressure_min) * (pr ** 0.85)
             else:
-                p_factor = 0.22 + 1.15 * (pr ** 1.25)
+                p_factor = 1.0
 
+            # B. Direction / Calligraphic Nib factor
             if i < len(pts) - 1:
                 dx = pts[i + 1][0] - px
                 dy = pts[i + 1][1] - py
+                seg_dist = math.hypot(dx, dy)
             elif i > 0:
                 dx = px - pts[i - 1][0]
                 dy = py - pts[i - 1][1]
+                seg_dist = math.hypot(dx, dy)
             else:
-                dx, dy = 1.0, 0.0
+                dx, dy, seg_dist = 1.0, 0.0, 0.0
 
-            seg_len = math.hypot(dx, dy)
-            if seg_len > 1e-3:
+            if direction_strength > 0.0 and seg_dist > 1e-3:
                 angle = math.atan2(dy, dx)
-                nib_influence = abs(math.sin(angle - self.nib_angle_rad))
-                if is_calligraphy_nib:
-                    nib_factor = 0.30 + 0.95 * nib_influence
-                elif is_velocity_pen:
-                    nib_factor = 1.0
-                else:
-                    nib_factor = 0.82 + 0.26 * nib_influence
+                nib_mod = abs(math.sin(angle - self.nib_angle_rad))
+                dir_factor = (1.0 - direction_strength) + direction_strength * nib_mod
             else:
-                nib_factor = 1.0
+                dir_factor = 1.0
 
-            rad = max(0.30, base_r * p_factor * nib_factor)
+            # C. Speed / Velocity thinning factor ("speed")
+            if (tool in ("speed", "velocity_pen") or speed_strength > 0.0) and i > 0:
+                d_prev = math.hypot(px - pts[i - 1][0], py - pts[i - 1][1])
+                vel_px_ms = d_prev / max(1.0, dt)
+                vel_atten = 1.0 / (1.0 + speed_scale * vel_px_ms * 1.6)
+                spd_factor = (1.0 - speed_strength) + speed_strength * vel_atten
+            else:
+                spd_factor = 1.0
+
+            # D. Taper factor ("taper")
+            if taper_enabled and total_len > 1.0:
+                t_norm = cum_lengths[i] / total_len
+                # Smoothly taper both ends (especially the tail) down to taper_min
+                edge_env = math.sin(math.pi * t_norm) ** 0.65
+                taper_factor = taper_min + (1.0 - taper_min) * edge_env
+            else:
+                taper_factor = 1.0
+
+            rad = max(0.30, base_r * p_factor * dir_factor * spd_factor * taper_factor)
             radii.append(rad)
+
+        # Lightly smooth the computed radii so width transitions are organic
+        if len(radii) >= 3:
+            smoothed_r = [radii[0]]
+            for i in range(1, len(radii) - 1):
+                smoothed_r.append(0.25 * radii[i - 1] + 0.5 * radii[i] + 0.25 * radii[i + 1])
+            smoothed_r.append(radii[-1])
+            radii = smoothed_r
 
         cr.save()
         if a < 0.99:

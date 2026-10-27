@@ -50,6 +50,34 @@ DEFAULT_RULED_TEMPLATE = {
     ]
 }
 
+DEFAULT_CHECKLIST_TEMPLATE_ID = "58ba828c343ad504"
+DEFAULT_CHECKLIST_TEMPLATE = {
+    "xtemplate": 1,
+    "id": "xtemplate.examples.todo",
+    "name": "Checklist",
+    "description": "Rows with a tick box each, stretched slightly so the rows fill the page exactly.",
+    "license": "MIT",
+    "tags": ["planner", "lists"],
+    "params": {
+        "row": {"type": "length", "default": "9mm", "min": "6mm", "max": "14mm", "label": "Row height", "role": "spacing"}
+    },
+    "items": [
+        {"type": "text", "text": "To do", "x": "15mm", "y": "18mm", "size": "5mm", "weight": "bold"},
+        {
+            "type": "group", "inset": ["25mm", "15mm", "15mm", "15mm"],
+            "children": [
+                {
+                    "type": "repeat", "axis": "y", "period": "row", "fit": "round",
+                    "children": [
+                        {"type": "rect", "y": "50% - 2.25mm", "w": "4.5mm", "h": "4.5mm", "rx": "0.8mm"},
+                        {"type": "hline", "y": "100%", "x1": "8mm"}
+                    ]
+                }
+            ]
+        }
+    ]
+}
+
 DEFAULT_FLOW_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:xnotes="urn:xnotes:flow:1.0" office:version="1.2" xnotes:margin-left-mm="20.0" xnotes:margin-top-mm="20.0" xnotes:margin-right-mm="20.0" xnotes:margin-bottom-mm="20.0" xnotes:default-face="sans" xnotes:default-size-pt="13.0">
  <office:automatic-styles>
@@ -133,11 +161,40 @@ class XNotePackageParser:
 
     @classmethod
     def bytes_to_surface(cls, data):
-        bytes_data = GLib.Bytes.new(data)
-        stream = Gio.MemoryInputStream.new_from_bytes(bytes_data)
-        pixbuf = GdkPixbuf.Pixbuf.new_from_stream(stream, None)
-        if pixbuf:
-            return cls.pixbuf_to_cairo_surface(pixbuf)
+        if not data:
+            return None
+        try:
+            bytes_data = GLib.Bytes.new(data)
+            stream = Gio.MemoryInputStream.new_from_bytes(bytes_data)
+            pixbuf = GdkPixbuf.Pixbuf.new_from_stream(stream, None)
+            if pixbuf:
+                return cls.pixbuf_to_cairo_surface(pixbuf)
+        except Exception:
+            pass
+
+        # Fallback for WebP images (e.g. strawberry-thief.webp) if webp-pixbuf-loader is missing
+        if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+            with tempfile.TemporaryDirectory() as tmpdir:
+                in_webp = os.path.join(tmpdir, "in.webp")
+                out_png = os.path.join(tmpdir, "out.png")
+                with open(in_webp, "wb") as f:
+                    f.write(data)
+                cmds = []
+                if shutil.which("dwebp"):
+                    cmds.append(["dwebp", in_webp, "-o", out_png])
+                if shutil.which("ffmpeg"):
+                    cmds.append(["ffmpeg", "-y", "-i", in_webp, out_png])
+                if shutil.which("magick"):
+                    cmds.append(["magick", in_webp, out_png])
+                elif shutil.which("convert"):
+                    cmds.append(["convert", in_webp, out_png])
+                for cmd in cmds:
+                    try:
+                        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        if os.path.isfile(out_png):
+                            return cairo.ImageSurface.create_from_png(out_png)
+                    except Exception:
+                        continue
         return None
 
     @staticmethod
@@ -162,7 +219,6 @@ class XNotePackageParser:
 
     @classmethod
     def _render_pdf_with_pdftoppm(cls, pdf_bytes, dpi=150):
-        """Fallback PDF rasterizer using pdftoppm if gir1.2-poppler-0.18 is not installed."""
         surfaces = []
         if not shutil.which("pdftoppm"):
             return surfaces
@@ -189,6 +245,29 @@ class XNotePackageParser:
             except Exception as e:
                 print(f"pdftoppm fallback failed: {e}")
         return surfaces
+
+    @classmethod
+    def _register_builtin_templates(cls, templates):
+        """Ensure standard v1 body templates (Ruled & Checklist) are always available."""
+        builtins = [
+            (DEFAULT_RULED_TEMPLATE_ID, DEFAULT_RULED_TEMPLATE),
+            (DEFAULT_CHECKLIST_TEMPLATE_ID, DEFAULT_CHECKLIST_TEMPLATE),
+        ]
+        for tid, meta in builtins:
+            if tid not in templates:
+                raw_b = json.dumps(meta, indent=2).encode("utf-8")
+                t_entry = {
+                    "id": tid,
+                    "path": f"templates/{tid}.xtemplate",
+                    "is_cover": False,
+                    "meta": meta,
+                    "surface": None,
+                    "images": {},
+                    "raw_bytes": raw_b,
+                }
+                templates[tid] = t_entry
+                if meta.get("id"):
+                    templates[meta["id"]] = t_entry
 
     @classmethod
     def _load_xtemplate_bytes(cls, name, data, assets, templates):
@@ -363,10 +442,6 @@ class XNotePackageParser:
 
     @classmethod
     def import_pdf_into_document(cls, pdf_path, doc, assets):
-        """
-        Import pages from an external PDF file into an existing .xnote document.
-        Uses Poppler vector rendering if available, or pdftoppm image assets as fallback.
-        """
         with open(pdf_path, "rb") as f:
             pdf_bytes = f.read()
 
@@ -380,7 +455,6 @@ class XNotePackageParser:
             if n_pages <= 0:
                 raise ValueError("Selected PDF has no pages.")
 
-            # Store PDF inside archive for native Poppler rendering
             doc["has_pdf"] = True
             doc["_pdf_bytes"] = pdf_bytes
             doc["_pdf_archive_name"] = doc.get("_pdf_archive_name", "document.pdf")
@@ -401,7 +475,6 @@ class XNotePackageParser:
                 pages_added += 1
             return pages_added
 
-        # Fallback: rasterize via pdftoppm into assets/
         surfaces = cls._render_pdf_with_pdftoppm(pdf_bytes, dpi=dpi)
         if not surfaces:
             raise RuntimeError(
@@ -443,7 +516,6 @@ class XNotePackageParser:
 
     @classmethod
     def create_notebook_from_pdf(cls, pdf_path, dest_xnote_path):
-        """Create a new .xnote archive populated with all pages from a PDF file."""
         now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         doc = {
             "format": "xnote",
@@ -461,28 +533,14 @@ class XNotePackageParser:
             }
         }
         assets = {}
-        t_bytes = json.dumps(DEFAULT_RULED_TEMPLATE, indent=2).encode("utf-8")
-        templates = {
-            DEFAULT_RULED_TEMPLATE_ID: {
-                "id": DEFAULT_RULED_TEMPLATE_ID,
-                "path": f"templates/{DEFAULT_RULED_TEMPLATE_ID}.xtemplate",
-                "is_cover": False,
-                "meta": DEFAULT_RULED_TEMPLATE,
-                "surface": None,
-                "images": {},
-                "raw_bytes": t_bytes,
-            }
-        }
+        templates = {}
+        cls._register_builtin_templates(templates)
         cls.import_pdf_into_document(pdf_path, doc, assets)
         cls.save_archive(dest_xnote_path, doc, templates=templates)
         return cls.load_archive(dest_xnote_path)
 
     @classmethod
     def export_to_pdf(cls, pdf_path, doc, canvas):
-        """
-        Export all pages of the current .xnote document (including templates, embedded PDF
-        backgrounds, calligraphic strokes, text, and images) to a vector PDF file.
-        """
         pages = doc.get("pages", [])
         if not pages:
             raise ValueError("Document has no pages to export.")
@@ -641,6 +699,9 @@ class XNotePackageParser:
                         except Exception as e:
                             print(f"Failed to load asset {name}: {e}")
 
+        if not thumbnails_only:
+            cls._register_builtin_templates(templates)
+
         if flow_info:
             doc["_flow"] = flow_info
         if raw_assets:
@@ -682,19 +743,8 @@ class XNotePackageParser:
                 "pattern_color": [0, 56, 183, 95]
             }
         }
-        t_bytes = json.dumps(DEFAULT_RULED_TEMPLATE, indent=2).encode("utf-8")
-        t_path = f"templates/{DEFAULT_RULED_TEMPLATE_ID}.xtemplate"
-        templates = {
-            DEFAULT_RULED_TEMPLATE_ID: {
-                "id": DEFAULT_RULED_TEMPLATE_ID,
-                "path": t_path,
-                "is_cover": False,
-                "meta": DEFAULT_RULED_TEMPLATE,
-                "surface": None,
-                "images": {},
-                "raw_bytes": t_bytes,
-            }
-        }
+        templates = {}
+        cls._register_builtin_templates(templates)
         cls.save_archive(path, doc, templates=templates)
         return cls.load_archive(path)
 
