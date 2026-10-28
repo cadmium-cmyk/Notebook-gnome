@@ -14,6 +14,8 @@ from markdown_renderer import MarkdownRenderer
 class LibraryManagerMixin:
     """Mixin class for XNotesViewerWindow handling folder scanning, thumbnail rendering, flowbox/listbox card generation, and library sorting."""
 
+    _thumbnail_cache = {}
+
     def _get_active_category_folder(self):
         if (
             self.active_notebook_filter not in ("ALL", ".", None)
@@ -369,6 +371,26 @@ class LibraryManagerMixin:
             return
         ext = os.path.splitext(path)[1].lower()
         try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0.0
+
+        cache_key = (path, mtime)
+        if cache_key in self._thumbnail_cache:
+            surface, thumb_w, thumb_h = self._thumbnail_cache[cache_key]
+            GLib.idle_add(
+                self._append_thumbnail_widget,
+                nb_key,
+                nb_title,
+                path,
+                surface,
+                thumb_w,
+                thumb_h,
+                load_id
+            )
+            return
+
+        try:
             if ext in ('.md', '.markdown'):
                 thumb_w, thumb_h = 150, 210
                 surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, thumb_w, thumb_h)
@@ -377,6 +399,7 @@ class LibraryManagerMixin:
                     preview_text = f.read(2400)
                 MarkdownRenderer.draw_markdown_thumb(cr, thumb_w, thumb_h, preview_text)
                 surface.flush()
+                self._thumbnail_cache[cache_key] = (surface, thumb_w, thumb_h)
                 GLib.idle_add(
                     self._append_thumbnail_widget,
                     nb_key,
@@ -405,6 +428,7 @@ class LibraryManagerMixin:
                 self.canvas.draw_page_thumb(cr, thumb_w, thumb_h, doc, page, pw, ph, assets, templates, page_idx=0)
                 surface.flush()
 
+                self._thumbnail_cache[cache_key] = (surface, thumb_w, thumb_h)
                 GLib.idle_add(
                     self._append_thumbnail_widget,
                     nb_key,
@@ -578,7 +602,16 @@ class LibraryManagerMixin:
         list_row.set_child(row_hbox)
         self.library_listbox.append(list_row)
 
-        self._apply_collection_filters()
+        query = self.search_entry.get_text().strip().lower()
+        selected_nb = self.active_notebook_filter
+        file_name = card_box.file_name.lower()
+        nb_title_lower = nb_title.lower()
+
+        nb_matches = (selected_nb == "ALL" or selected_nb == nb_key)
+        query_matches = (not query) or (query in file_name) or (query in nb_title_lower)
+        card_box.get_parent().set_visible(nb_matches and query_matches)
+        list_row.set_visible(nb_matches and query_matches)
+
         self.library_flowbox.invalidate_sort()
         self.library_listbox.invalidate_sort()
         return False

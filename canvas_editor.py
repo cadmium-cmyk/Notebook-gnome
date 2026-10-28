@@ -643,12 +643,15 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
         if self._active_stroke is not None:
             samples = self._active_stroke["samples"]
             last = samples[-1]
-            raw_dist = math.hypot(px - self._last_raw_pt[0], py - self._last_raw_pt[1])
-            now = time.perf_counter()
-            dt_sec = max(1e-4, now - self._last_sample_time)
-            dt_ms = max(1, int(round(dt_sec * 1000.0)))
+            dx = px - self._last_raw_pt[0]
+            dy = py - self._last_raw_pt[1]
+            raw_dist_sq = dx * dx + dy * dy
 
-            if raw_dist >= 0.8:
+            if raw_dist_sq >= 0.64:
+                now = time.perf_counter()
+                dt_sec = max(1e-4, now - self._last_sample_time)
+                dt_ms = max(1, int(round(dt_sec * 1000.0)))
+
                 smooth_x = 0.65 * px + 0.35 * last[0]
                 smooth_y = 0.65 * py + 0.35 * last[1]
                 self._smoothed_pressure = 0.6 * self._smoothed_pressure + 0.4 * pressure

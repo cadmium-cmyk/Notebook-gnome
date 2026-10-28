@@ -456,6 +456,13 @@ class XNotesViewerWindow(
         self.save_btn.connect("clicked", self.on_save_clicked)
         viewer_header.pack_start(self.save_btn)
 
+        self.export_pdf_btn = Gtk.Button(
+            icon_name="document-send-symbolic",
+            tooltip_text="Export Notebook to PDF…"
+        )
+        self.export_pdf_btn.connect("clicked", self.on_export_pdf_clicked)
+        viewer_header.pack_start(self.export_pdf_btn)
+
         self.history_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         self.history_box.add_css_class("linked")
         self.undo_btn = Gtk.Button(
@@ -474,36 +481,6 @@ class XNotesViewerWindow(
         self.redo_btn.connect("clicked", self.on_redo_activated)
         self.history_box.append(self.redo_btn)
         viewer_header.pack_start(self.history_box)
-
-        # External App & Export PDF Box
-        self.ext_open_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        self.ext_open_box.add_css_class("linked")
-
-        self.export_pdf_btn = Gtk.Button(
-            icon_name="document-send-symbolic",
-            tooltip_text="Export Notebook to PDF…"
-        )
-        self.export_pdf_btn.connect("clicked", self.on_export_pdf_clicked)
-        self.ext_open_box.append(self.export_pdf_btn)
-
-        self.open_default_btn = Gtk.Button(
-            icon_name="document-export-symbolic",
-            tooltip_text="Open with System Default Application"
-        )
-        self.open_default_btn.connect(
-            "clicked", lambda *_: self.open_with_default_app(self.current_file_path)
-        )
-        self.ext_open_box.append(self.open_default_btn)
-
-        self.open_with_btn = Gtk.Button(
-            icon_name="applications-other-symbolic",
-            tooltip_text="Select Application to Open With…"
-        )
-        self.open_with_btn.connect(
-            "clicked", lambda *_: self.choose_app_for_file(self.current_file_path)
-        )
-        self.ext_open_box.append(self.open_with_btn)
-        viewer_header.pack_end(self.ext_open_box)
 
         # Zoom controls + Fit Page Width button
         self.zoom_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
@@ -538,6 +515,37 @@ class XNotesViewerWindow(
         self.zoom_box.append(self.fit_width_btn)
 
         viewer_header.pack_end(self.zoom_box)
+
+        # Markdown View Mode Switcher (Editor default, Split, Preview) in Headerbar
+        self.md_mode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self.md_mode_box.add_css_class("linked")
+        self.md_mode_box.set_visible(False)
+
+        self.md_edit_btn = Gtk.ToggleButton(
+            icon_name=self._resolve_icon_name("document-edit-symbolic", "accessories-text-editor-symbolic"),
+            active=True,
+            tooltip_text="Markdown Editor View (Ctrl+M)"
+        )
+        self.md_edit_btn.connect("toggled", self._on_md_mode_toggled, "edit")
+        self.md_mode_box.append(self.md_edit_btn)
+
+        self.md_split_btn = Gtk.ToggleButton(
+            icon_name="view-dual-symbolic",
+            group=self.md_edit_btn,
+            tooltip_text="Side-by-Side Split View (Ctrl+M)"
+        )
+        self.md_split_btn.connect("toggled", self._on_md_mode_toggled, "split")
+        self.md_mode_box.append(self.md_split_btn)
+
+        self.md_preview_btn = Gtk.ToggleButton(
+            icon_name="view-reveal-symbolic",
+            group=self.md_edit_btn,
+            tooltip_text="Formatted Paper Preview (Ctrl+M)"
+        )
+        self.md_preview_btn.connect("toggled", self._on_md_mode_toggled, "preview")
+        self.md_mode_box.append(self.md_preview_btn)
+
+        viewer_header.pack_end(self.md_mode_box)
 
         # View Mode toggle controls (Paged vs Scrolled for .xnote)
         self.mode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
@@ -811,35 +819,6 @@ class XNotesViewerWindow(
         )
         self.md_toolbar_bar.add_css_class("stylus-toolbar")
 
-        # Start widget: View Mode Switcher (Editor default, Split, Preview)
-        md_mode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        md_mode_box.add_css_class("linked")
-
-        self.md_edit_btn = Gtk.ToggleButton(
-            icon_name=self._resolve_icon_name("document-edit-symbolic", "accessories-text-editor-symbolic"),
-            active=True,
-            tooltip_text="Markdown Editor View (Ctrl+M)"
-        )
-        self.md_edit_btn.connect("toggled", self._on_md_mode_toggled, "edit")
-        md_mode_box.append(self.md_edit_btn)
-
-        self.md_split_btn = Gtk.ToggleButton(
-            icon_name="view-dual-symbolic",
-            group=self.md_edit_btn,
-            tooltip_text="Side-by-Side Split View (Ctrl+M)"
-        )
-        self.md_split_btn.connect("toggled", self._on_md_mode_toggled, "split")
-        md_mode_box.append(self.md_split_btn)
-
-        self.md_preview_btn = Gtk.ToggleButton(
-            icon_name="view-reveal-symbolic",
-            group=self.md_edit_btn,
-            tooltip_text="Formatted Paper Preview (Ctrl+M)"
-        )
-        self.md_preview_btn.connect("toggled", self._on_md_mode_toggled, "preview")
-        md_mode_box.append(self.md_preview_btn)
-
-        self.md_toolbar_bar.set_start_widget(md_mode_box)
 
         # Center widget: Symbolic Formatting Toolbar + Find in Page button
         center_fmt_wrap = Gtk.Box(
@@ -2248,6 +2227,7 @@ class XNotesViewerWindow(
             self.viewer_stack.set_visible_child_name("markdown_doc")
             self.page_sidebar_btn.set_visible(False)
             self.mode_box.set_visible(False)
+            self.md_mode_box.set_visible(True)
             self.stylus_bar.set_visible(False)
             self.md_toolbar_bar.set_visible(True)
             self.save_btn.set_visible(True)
@@ -2297,6 +2277,7 @@ class XNotesViewerWindow(
             self.page_sidebar_revealer.set_reveal_child(False)
 
             self.mode_box.set_visible(True)
+            self.md_mode_box.set_visible(False)
             self.md_toolbar_bar.set_visible(False)
             self.stylus_bar.set_visible(is_editable)
             self.save_btn.set_visible(is_editable)

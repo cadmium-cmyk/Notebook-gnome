@@ -666,6 +666,33 @@ class XNotePackageParser:
                 }
                 return doc, assets, templates
 
+            needed_assets = set()
+            needed_templates = set()
+
+            if thumbnails_only:
+                doc_style = doc.get("style", {}) if isinstance(doc.get("style"), dict) else {}
+                t_doc = doc_style.get("template") or doc_style.get("pattern")
+                if t_doc:
+                    needed_templates.add(t_doc)
+                    needed_templates.add(cls.extract_template_id(t_doc))
+                    needed_templates.add(os.path.basename(t_doc))
+
+                pages = doc.get("pages", [])
+                if pages:
+                    p0 = pages[0]
+                    p0_style = p0.get("style", {}) if isinstance(p0.get("style"), dict) else {}
+                    t_p0 = p0_style.get("template") or p0_style.get("pattern") or p0.get("template")
+                    if t_p0:
+                        needed_templates.add(t_p0)
+                        needed_templates.add(cls.extract_template_id(t_p0))
+                        needed_templates.add(os.path.basename(t_p0))
+                    for item in p0.get("items", []):
+                        if isinstance(item, dict):
+                            a = item.get("asset") or item.get("src") or item.get("image")
+                            if a:
+                                needed_assets.add(a)
+                                needed_assets.add(os.path.basename(a))
+
             if 'flow.xml' in namelist:
                 try:
                     flow_info = cls._parse_flow_xml(z.read('flow.xml'))
@@ -677,6 +704,23 @@ class XNotePackageParser:
                     continue
 
                 lower_name = name.lower()
+                base_name = os.path.basename(name)
+                tid_name = cls.extract_template_id(name)
+
+                if thumbnails_only:
+                    is_template = lower_name.endswith('.xtemplate') or name.startswith('templates/')
+                    is_pdf = lower_name.endswith('.pdf')
+                    is_asset = name.startswith('assets/')
+
+                    if is_template:
+                        if needed_templates and not (name in needed_templates or base_name in needed_templates or tid_name in needed_templates):
+                            continue
+                    elif is_asset:
+                        if needed_assets and not (name in needed_assets or base_name in needed_assets or tid_name in needed_assets):
+                            continue
+                    elif not is_pdf:
+                        continue
+
                 try:
                     raw_data = z.read(name)
                 except Exception as e:
