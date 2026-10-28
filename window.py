@@ -456,6 +456,13 @@ class XNotesViewerWindow(
         self.save_btn.connect("clicked", self.on_save_clicked)
         viewer_header.pack_start(self.save_btn)
 
+        self.export_pdf_btn = Gtk.Button(
+            icon_name="document-send-symbolic",
+            tooltip_text="Export Notebook to PDF…"
+        )
+        self.export_pdf_btn.connect("clicked", self.on_export_pdf_clicked)
+        viewer_header.pack_start(self.export_pdf_btn)
+
         self.history_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         self.history_box.add_css_class("linked")
         self.undo_btn = Gtk.Button(
@@ -474,36 +481,6 @@ class XNotesViewerWindow(
         self.redo_btn.connect("clicked", self.on_redo_activated)
         self.history_box.append(self.redo_btn)
         viewer_header.pack_start(self.history_box)
-
-        # External App & Export PDF Box
-        self.ext_open_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        self.ext_open_box.add_css_class("linked")
-
-        self.export_pdf_btn = Gtk.Button(
-            icon_name="document-send-symbolic",
-            tooltip_text="Export Notebook to PDF…"
-        )
-        self.export_pdf_btn.connect("clicked", self.on_export_pdf_clicked)
-        self.ext_open_box.append(self.export_pdf_btn)
-
-        self.open_default_btn = Gtk.Button(
-            icon_name="document-export-symbolic",
-            tooltip_text="Open with System Default Application"
-        )
-        self.open_default_btn.connect(
-            "clicked", lambda *_: self.open_with_default_app(self.current_file_path)
-        )
-        self.ext_open_box.append(self.open_default_btn)
-
-        self.open_with_btn = Gtk.Button(
-            icon_name="applications-other-symbolic",
-            tooltip_text="Select Application to Open With…"
-        )
-        self.open_with_btn.connect(
-            "clicked", lambda *_: self.choose_app_for_file(self.current_file_path)
-        )
-        self.ext_open_box.append(self.open_with_btn)
-        viewer_header.pack_end(self.ext_open_box)
 
         # Zoom controls + Fit Page Width button
         self.zoom_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)

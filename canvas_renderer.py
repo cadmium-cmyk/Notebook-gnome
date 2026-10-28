@@ -737,13 +737,13 @@ class CanvasRendererMixin:
         PangoCairo.show_layout(cr, layout)
 
     @staticmethod
-    def _fill_variable_capsule(cr, x0, y0, r0, x1, y1, r1):
+    def _add_variable_capsule_path(cr, x0, y0, r0, x1, y1, r1):
         dx = x1 - x0
         dy = y1 - y0
         dist = math.hypot(dx, dy)
 
+        cr.new_sub_path()
         cr.arc(x0, y0, r0, 0.0, 2.0 * math.pi)
-        cr.fill()
         if dist < 1e-3:
             return
 
@@ -752,15 +752,15 @@ class CanvasRendererMixin:
         nx = -uy
         ny = ux
 
+        cr.new_sub_path()
         cr.move_to(x0 + nx * r0, y0 + ny * r0)
         cr.line_to(x1 + nx * r1, y1 + ny * r1)
         cr.line_to(x1 - nx * r1, y1 - ny * r1)
         cr.line_to(x0 - nx * r0, y0 - ny * r0)
         cr.close_path()
-        cr.fill()
 
+        cr.new_sub_path()
         cr.arc(x1, y1, r1, 0.0, 2.0 * math.pi)
-        cr.fill()
 
     def draw_stroke(self, cr, stroke):
         raw_samples = stroke.get("samples") or stroke.get("points")
@@ -936,31 +936,24 @@ class CanvasRendererMixin:
             radii = smoothed_r
 
         cr.save()
+        cr.new_path()
+        if len(pts) == 1:
+            cr.arc(pts[0][0], pts[0][1], radii[0], 0.0, 2.0 * math.pi)
+        else:
+            for i in range(len(pts) - 1):
+                self._add_variable_capsule_path(
+                    cr,
+                    pts[i][0], pts[i][1], radii[i],
+                    pts[i + 1][0], pts[i + 1][1], radii[i + 1]
+                )
+
         if a < 0.99:
             cr.push_group()
             cr.set_source_rgb(r, g, b)
-            if len(pts) == 1:
-                cr.arc(pts[0][0], pts[0][1], radii[0], 0.0, 2.0 * math.pi)
-                cr.fill()
-            else:
-                for i in range(len(pts) - 1):
-                    self._fill_variable_capsule(
-                        cr,
-                        pts[i][0], pts[i][1], radii[i],
-                        pts[i + 1][0], pts[i + 1][1], radii[i + 1]
-                    )
+            cr.fill()
             cr.pop_group_to_source()
             cr.paint_with_alpha(a)
         else:
             cr.set_source_rgb(r, g, b)
-            if len(pts) == 1:
-                cr.arc(pts[0][0], pts[0][1], radii[0], 0.0, 2.0 * math.pi)
-                cr.fill()
-            else:
-                for i in range(len(pts) - 1):
-                    self._fill_variable_capsule(
-                        cr,
-                        pts[i][0], pts[i][1], radii[i],
-                        pts[i + 1][0], pts[i + 1][1], radii[i + 1]
-                    )
+            cr.fill()
         cr.restore()
