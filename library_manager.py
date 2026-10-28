@@ -344,16 +344,16 @@ class LibraryManagerMixin:
             row = self._create_sidebar_row(
                 nb_info["title"],
                 nb_key,
-                icon_name="folder-symbolic",
+                icon_name="feather-tag-symbolic",
                 section_label="Categories" if first_cat else None
             )
             first_cat = False
             self.notebook_listbox.append(row)
 
         new_cat_row = self._create_sidebar_row(
-            "New Category…",
+            "New",
             "__NEW_CATEGORY__",
-            icon_name=self._resolve_icon_name("folder-new-symbolic", "list-add-symbolic"),
+            icon_name=self._resolve_icon_name("list-add-symbolic", "list-add-symbolic"),
             section_label="Categories" if first_cat else None,
             is_new_category_action=True
         )
@@ -530,7 +530,7 @@ class LibraryManagerMixin:
             cr.restore()
 
         mini_da.set_draw_func(draw_mini_thumb)
-        row_hbox.append(mini_da)
+        # row_hbox.append(mini_da)
 
         info_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, valign=Gtk.Align.CENTER, hexpand=True)
         row_title_lbl = Gtk.Label(
@@ -594,24 +594,24 @@ class LibraryManagerMixin:
             margin_end=6
         )
 
-        view_btn = Gtk.Button(label="Open in Notebooks Editor")
+        view_btn = Gtk.Button(label="Open")
         view_btn.add_css_class("flat")
         view_btn.connect("clicked", lambda *_: (popover.popdown(), self.load_document(path)))
         vbox.append(view_btn)
 
-        default_btn = Gtk.Button(label="Open with Default Application")
+        default_btn = Gtk.Button(label="Open in External Editor")
         default_btn.add_css_class("flat")
         default_btn.connect("clicked", lambda *_: (popover.popdown(), self.open_with_default_app(path)))
         vbox.append(default_btn)
 
-        choose_btn = Gtk.Button(label="Select Application to Open With...")
+        choose_btn = Gtk.Button(label="Open With...")
         choose_btn.add_css_class("flat")
         choose_btn.connect("clicked", lambda *_: (popover.popdown(), self.choose_app_for_file(path)))
         vbox.append(choose_btn)
 
         vbox.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
-        folder_btn = Gtk.Button(label="Open Containing Folder")
+        folder_btn = Gtk.Button(label="Show in Folder")
         folder_btn.add_css_class("flat")
         folder_btn.connect("clicked", lambda *_: (popover.popdown(), self.open_containing_folder(path)))
         vbox.append(folder_btn)

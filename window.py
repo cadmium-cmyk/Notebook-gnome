@@ -1,4 +1,5 @@
 import os
+import re
 import math
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -10,7 +11,7 @@ from gi.repository import Gtk, Adw, Gio, GLib, Gdk
 
 from xnote_io import XNotePackageParser
 from canvas_editor import XNoteCanvas
-from markdown_renderer import MarkdownRenderer
+from markdown_renderer import MarkdownRenderer, MarkdownInlineStyler
 
 from library_manager import LibraryManagerMixin
 from page_sidebar import PageSidebarMixin
@@ -38,8 +39,12 @@ class XNotesViewerWindow(
         self.current_file_path = None
         self.current_file_type = None  # "xnote", "xcanvas", "xtemplate", or "md"
         self.markdown_content = ""
-        self.md_view_mode = "split"  # "preview", "split", or "edit"
+        self.md_view_mode = "edit"  # Show editor view by default, not split pane
         self._loading_md_buffer = False
+        self._syncing_md_scroll = False
+        self.md_search_matches = []
+        self.md_search_idx = -1
+
         self.current_root_folder = None
         self.active_notebook_filter = "ALL"
         self.notebooks_data = {}
@@ -150,6 +155,25 @@ class XNotesViewerWindow(
                 padding: 2px;
                 border-radius: 999px;
             }
+            .md-editor-view {
+                font-family: monospace;
+                font-size: 14px;
+                background-color: #ffffff;
+                color: #2e3436;
+            }
+            .md-editor-view text {
+                background-color: #ffffff;
+                color: #2e3436;
+            }
+            .md-preview-scroll {
+                background-color: #f6f6f6;
+                border-left: 1px solid #e1e1e1;
+            }
+            .md-split-preview-box {
+                background-color: transparent;
+                color: #2e3436;
+                padding: 32px 36px;
+            }
             .md-paper {
                 background-color: #ffffff;
                 color: #1e1e1e;
@@ -157,15 +181,12 @@ class XNotesViewerWindow(
                 padding: 36px 44px;
                 border: 1px solid rgba(0, 0, 0, 0.14);
             }
-            .md-editor-view {
-                font-family: monospace;
-                font-size: 13.5px;
-                padding: 20px;
-                background-color: @view_bg_color;
-                color: @view_fg_color;
+            .md-heading-rule {
+                background-color: #dcdcdc;
+                min-height: 1px;
             }
             .md-code-block {
-                background-color: #f4f4f6;
+                background-color: #ececef;
                 color: #1e1e1e;
                 border-radius: 8px;
                 padding: 12px 16px;
@@ -199,15 +220,15 @@ class XNotesViewerWindow(
         sidebar_toolbar = Adw.ToolbarView()
         sidebar_header = Adw.HeaderBar()
         sidebar_header.set_show_end_title_buttons(False)
-        sidebar_title = Adw.WindowTitle(title="Categories", subtitle="")
+        sidebar_title = Adw.WindowTitle(title="Notebook", subtitle="")
         sidebar_header.set_title_widget(sidebar_title)
 
         sidebar_menu = Gio.Menu()
-        sidebar_menu.append("New Category…", "win.new-category")
-        sidebar_menu.append("New .xnote Notebook…", "win.new-notebook")
-        sidebar_menu.append("New .xnote from PDF…", "win.import-pdf-new")
-        sidebar_menu.append("New Markdown Note…", "win.new-markdown")
-        sidebar_menu.append("Open Collection Folder…", "win.open")
+        sidebar_menu.append("New Category", "win.new-category")
+        sidebar_menu.append("New Notebook", "win.new-notebook")
+        sidebar_menu.append("Import from PDF", "win.import-pdf-new")
+        sidebar_menu.append("New Text Document", "win.new-markdown")
+        sidebar_menu.append("Open Folder", "win.open")
         sidebar_menu.append("Quit", "app.quit")
         sidebar_menu_btn = Gtk.MenuButton(
             icon_name="open-menu-symbolic",
@@ -232,7 +253,7 @@ class XNotesViewerWindow(
         content_toolbar = Adw.ToolbarView()
         content_header = Adw.HeaderBar()
         content_header.set_show_start_title_buttons(False)
-        self.collection_title = Adw.WindowTitle(title="Library", subtitle="")
+        self.collection_title = Adw.WindowTitle(title="", subtitle="")
         content_header.set_title_widget(self.collection_title)
 
         self.open_btn = Gtk.Button(
@@ -240,19 +261,18 @@ class XNotesViewerWindow(
             tooltip_text="Open Collection Folder (Ctrl+O)"
         )
         self.open_btn.set_action_name("win.open")
-        content_header.pack_start(self.open_btn)
+        # content_header.pack_start(self.open_btn)
 
         new_menu = Gio.Menu()
-        new_menu.append("New .xnote Notebook (Ctrl+N)", "win.new-notebook")
-        new_menu.append("New .xnote from PDF…", "win.import-pdf-new")
-        new_menu.append("New Markdown Note (.md)", "win.new-markdown")
-        new_menu.append("New Category Folder…", "win.new-category")
+        new_menu.append("New Notebook", "win.new-notebook")
+        new_menu.append("Import from PDF", "win.import-pdf-new")
+        new_menu.append("New Text Note", "win.new-markdown")
+        new_menu.append("New Category", "win.new-category")
         self.new_note_btn = Gtk.MenuButton(
             icon_name="document-new-symbolic",
             menu_model=new_menu,
             tooltip_text="Create New Notebook, Import PDF, Markdown Note, or Category"
         )
-        content_header.pack_start(self.new_note_btn)
 
         self.search_btn = Gtk.ToggleButton(
             icon_name="system-search-symbolic",
@@ -385,7 +405,7 @@ class XNotesViewerWindow(
                 Adw.NavigationPage.new(sidebar_toolbar, "Categories")
             )
             self.split_view.set_content(
-                Adw.NavigationPage.new(content_toolbar, "Library")
+                Adw.NavigationPage.new(content_toolbar, "Documents")
             )
         elif hasattr(Adw, "OverlaySplitView"):
             self.split_view = Adw.OverlaySplitView()
@@ -443,15 +463,15 @@ class XNotesViewerWindow(
             tooltip_text="Undo (Ctrl+Z)",
             sensitive=False
         )
-        self.undo_btn.connect("clicked", lambda *_: self.canvas.undo())
+        self.undo_btn.connect("clicked", self.on_undo_activated)
         self.history_box.append(self.undo_btn)
 
         self.redo_btn = Gtk.Button(
             icon_name="edit-redo-symbolic",
-            tooltip_text="Redo (Ctrl+Y)",
+            tooltip_text="Redo (Ctrl+Y / Ctrl+Shift+Z)",
             sensitive=False
         )
-        self.redo_btn.connect("clicked", lambda *_: self.canvas.redo())
+        self.redo_btn.connect("clicked", self.on_redo_activated)
         self.history_box.append(self.redo_btn)
         viewer_header.pack_start(self.history_box)
 
@@ -467,7 +487,7 @@ class XNotesViewerWindow(
         self.ext_open_box.append(self.export_pdf_btn)
 
         self.open_default_btn = Gtk.Button(
-            icon_name="external-link-symbolic",
+            icon_name="document-export-symbolic",
             tooltip_text="Open with System Default Application"
         )
         self.open_default_btn.connect(
@@ -783,66 +803,152 @@ class XNotesViewerWindow(
         viewer_toolbar.add_top_bar(self.stylus_bar)
 
         # =====================================================================
-        # 2b. MARKDOWN EDITING BAR (.md / .markdown)
+        # 2b. REFINED CENTERED MARKDOWN EDITING BAR (.md / .markdown)
         # =====================================================================
-        self.md_toolbar_bar = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL,
-            spacing=12,
+        self.md_toolbar_bar = Gtk.CenterBox(
             halign=Gtk.Align.FILL,
             visible=False
         )
         self.md_toolbar_bar.add_css_class("stylus-toolbar")
 
+        # Start widget: View Mode Switcher (Editor default, Split, Preview)
         md_mode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         md_mode_box.add_css_class("linked")
 
-        self.md_preview_btn = Gtk.ToggleButton(
-            icon_name="view-reveal-symbolic",
-            tooltip_text="Read-Only Formatted Preview"
-        )
-        self.md_preview_btn.connect("toggled", self._on_md_mode_toggled, "preview")
-        md_mode_box.append(self.md_preview_btn)
-
-        self.md_split_btn = Gtk.ToggleButton(
-            icon_name="view-dual-symbolic",
-            group=self.md_preview_btn,
-            active=True,
-            tooltip_text="Side-by-Side Live Editor & Preview"
-        )
-        self.md_split_btn.connect("toggled", self._on_md_mode_toggled, "split")
-        md_mode_box.append(self.md_split_btn)
-
         self.md_edit_btn = Gtk.ToggleButton(
-            icon_name="document-properties-symbolic",
-            group=self.md_preview_btn,
-            tooltip_text="Full-Width Markdown Source Editor"
+            icon_name=self._resolve_icon_name("document-edit-symbolic", "accessories-text-editor-symbolic"),
+            active=True,
+            tooltip_text="Markdown Editor View (Ctrl+M)"
         )
         self.md_edit_btn.connect("toggled", self._on_md_mode_toggled, "edit")
         md_mode_box.append(self.md_edit_btn)
 
-        self.md_toolbar_bar.append(md_mode_box)
+        self.md_split_btn = Gtk.ToggleButton(
+            icon_name="view-dual-symbolic",
+            group=self.md_edit_btn,
+            tooltip_text="Side-by-Side Split View (Ctrl+M)"
+        )
+        self.md_split_btn.connect("toggled", self._on_md_mode_toggled, "split")
+        md_mode_box.append(self.md_split_btn)
+
+        self.md_preview_btn = Gtk.ToggleButton(
+            icon_name="view-reveal-symbolic",
+            group=self.md_edit_btn,
+            tooltip_text="Formatted Paper Preview (Ctrl+M)"
+        )
+        self.md_preview_btn.connect("toggled", self._on_md_mode_toggled, "preview")
+        md_mode_box.append(self.md_preview_btn)
+
+        self.md_toolbar_bar.set_start_widget(md_mode_box)
+
+        # Center widget: Symbolic Formatting Toolbar + Find in Page button
+        center_fmt_wrap = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=8,
+            halign=Gtk.Align.CENTER
+        )
 
         fmt_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         fmt_box.add_css_class("linked")
 
         fmt_specs = [
-            ("format-text-bold-symbolic", "Bold (**text**)", "**", "**"),
-            ("format-text-italic-symbolic", "Italic (*text*)", "*", "*"),
-            ("format-text-strikethrough-symbolic", "Strikethrough (~~text~~)", "~~", "~~"),
-            ("code-symbolic", "Inline Code (`code`)", "`", "`"),
-            ("format-text-larger-symbolic", "Heading 1 (# )", "# ", ""),
-            ("format-indent-more-symbolic", "Heading 2 (## )", "## ", ""),
-            ("view-list-bullet-symbolic", "Bullet List Item (- )", "- ", ""),
-            ("object-select-symbolic", "Task Checkbox (- [ ] )", "- [ ] ", ""),
-            ("format-text-direction-ltr-symbolic", "Blockquote (> )", "> ", ""),
+            ("format-text-bold-symbolic", "Bold (Ctrl+B)", "**", "**"),
+            ("format-text-italic-symbolic", "Italic (Ctrl+I)", "*", "*"),
+            ("format-text-strikethrough-symbolic", "Strikethrough (Ctrl+Shift+X)", "~~", "~~"),
+            (self._resolve_icon_name("code-context-symbolic", "utilities-terminal-symbolic"), "Inline Code (Ctrl+E)", "`", "`"),
+            ("format-text-larger-symbolic", "Heading 1 (Ctrl+1)", "# ", ""),
+            ("format-text-smaller-symbolic", "Heading 2 (Ctrl+2)", "## ", ""),
+            ("view-list-bullet-symbolic", "Bullet List (Ctrl+Shift+L)", "- ", ""),
+            (self._resolve_icon_name("view-list-ordered-symbolic", "view-list-symbolic"), "Numbered List", "1. ", ""),
+            ("object-select-symbolic", "Task Checkbox", "- [ ] ", ""),
+            ("format-text-blockquote-symbolic", "Blockquote (Ctrl+Shift+Q)", "> ", ""),
+            ("link-symbolic", "Insert Link (Ctrl+K)", "[", "](https://)"),
+            ("list-remove-symbolic", "Horizontal Rule", "\n---\n", ""),
         ]
         for icon_name, tip, prefix, suffix in fmt_specs:
             b = Gtk.Button(icon_name=icon_name, tooltip_text=tip)
             b.connect("clicked", self._on_md_format_clicked, prefix, suffix)
             fmt_box.append(b)
 
-        self.md_toolbar_bar.append(fmt_box)
+        center_fmt_wrap.append(fmt_box)
+
+        # Inline Rendering toggle + Find in Page toggle button
+        md_tools_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+
+        self.md_inline_render_btn = Gtk.ToggleButton(
+            icon_name=self._resolve_icon_name("view-conceal-symbolic", "applications-science-symbolic"),
+            active=True,
+            tooltip_text="Toggle Live Inline Markdown Rendering"
+        )
+        self.md_inline_render_btn.connect("toggled", self._on_md_inline_render_toggled)
+        md_tools_box.append(self.md_inline_render_btn)
+
+        self.md_find_btn = Gtk.ToggleButton(
+            icon_name="system-search-symbolic",
+            tooltip_text="Find in Page (Ctrl+F)"
+        )
+        self.md_find_btn.connect("toggled", self._on_md_find_toggled)
+        md_tools_box.append(self.md_find_btn)
+
+        center_fmt_wrap.append(md_tools_box)
+        self.md_toolbar_bar.set_center_widget(center_fmt_wrap)
+
         viewer_toolbar.add_top_bar(self.md_toolbar_bar)
+
+        # =====================================================================
+        # 2b-ii. MARKDOWN FIND IN PAGE SEARCH BAR
+        # =====================================================================
+        self.md_search_bar = Gtk.SearchBar()
+        self.md_search_bar.set_show_close_button(True)
+
+        md_search_box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=6,
+            halign=Gtk.Align.CENTER
+        )
+        self.md_search_entry = Gtk.SearchEntry(
+            placeholder_text="Find in note…",
+            width_chars=28
+        )
+        self.md_search_entry.connect("search-changed", self._on_md_search_changed)
+        self.md_search_entry.connect("activate", lambda *_: self._step_md_search(1))
+        self.md_search_entry.connect("next-match", lambda *_: self._step_md_search(1))
+        self.md_search_entry.connect("previous-match", lambda *_: self._step_md_search(-1))
+        self.md_search_entry.connect("stop-search", lambda *_: self.md_find_btn.set_active(False))
+        md_search_box.append(self.md_search_entry)
+
+        nav_match_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        nav_match_box.add_css_class("linked")
+
+        self.md_search_prev_btn = Gtk.Button(
+            icon_name="go-up-symbolic",
+            tooltip_text="Previous Match (Shift+Enter)"
+        )
+        self.md_search_prev_btn.connect("clicked", lambda *_: self._step_md_search(-1))
+        nav_match_box.append(self.md_search_prev_btn)
+
+        self.md_search_next_btn = Gtk.Button(
+            icon_name="go-down-symbolic",
+            tooltip_text="Next Match (Enter)"
+        )
+        self.md_search_next_btn.connect("clicked", lambda *_: self._step_md_search(1))
+        nav_match_box.append(self.md_search_next_btn)
+
+        md_search_box.append(nav_match_box)
+
+        self.md_search_count_lbl = Gtk.Label(label="")
+        self.md_search_count_lbl.add_css_class("dim-label")
+        self.md_search_count_lbl.add_css_class("numeric")
+        self.md_search_count_lbl.set_margin_start(6)
+        md_search_box.append(self.md_search_count_lbl)
+
+        self.md_search_bar.set_child(md_search_box)
+        self.md_search_bar.connect_entry(self.md_search_entry)
+        self.md_search_bar.connect(
+            "notify::search-mode-enabled",
+            self._on_md_search_bar_mode_notify
+        )
+        viewer_toolbar.add_top_bar(self.md_search_bar)
 
         # Document Viewer Stack
         self.viewer_stack = Gtk.Stack(hexpand=True, vexpand=True)
@@ -978,42 +1084,63 @@ class XNotesViewerWindow(
         self.canvas_workspace_box.append(self.viewer_overlay)
         self.viewer_stack.add_named(self.canvas_workspace_box, "canvas_doc")
 
-        # 2d. Markdown Split Editor & Live Paper Preview (.md / .markdown)
-        self.md_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, wide_handle=True)
-        self.md_paned.set_position(540)
+        # =====================================================================
+        # 2d. Markdown Split Editor & Live Preview (.md / .markdown)
+        # =====================================================================
+        self.md_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, wide_handle=False)
+        self.md_paned.set_position(600)
 
         self.md_edit_scrolled = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
         self.md_textview = Gtk.TextView(
             wrap_mode=Gtk.WrapMode.WORD_CHAR,
-            left_margin=20,
-            right_margin=20,
-            top_margin=20,
-            bottom_margin=20,
+            left_margin=64,
+            right_margin=40,
+            top_margin=36,
+            bottom_margin=36,
+            pixels_above_lines=3,
+            pixels_below_lines=3,
             monospace=True
         )
         self.md_textview.add_css_class("md-editor-view")
         self.md_buffer = self.md_textview.get_buffer()
+        if hasattr(self.md_buffer, "set_enable_undo"):
+            self.md_buffer.set_enable_undo(True)
+        self.md_inline_styler = MarkdownInlineStyler(self.md_textview)
         self.md_buffer.connect("changed", self._on_md_buffer_changed)
+        self.md_buffer.connect("notify::can-undo", lambda *_: self._sync_md_undo_redo_buttons())
+        self.md_buffer.connect("notify::can-redo", lambda *_: self._sync_md_undo_redo_buttons())
+
+        # CAPTURE phase key controller so Return/Enter & shortcuts are handled cleanly
+        md_key_ctrl = Gtk.EventControllerKey()
+        md_key_ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        md_key_ctrl.connect("key-pressed", self._on_md_key_pressed)
+        self.md_textview.add_controller(md_key_ctrl)
+
         self.md_edit_scrolled.set_child(self.md_textview)
         self.md_paned.set_start_child(self.md_edit_scrolled)
 
-        self.md_scrolled = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
-        md_outer = Gtk.Box(
+        self.md_scrolled = Gtk.ScrolledWindow(hexpand=True, vexpand=True, visible=False)
+        self.md_scrolled.add_css_class("md-preview-scroll")
+
+        # Setup synchronized scrolling adjustments between editor and preview
+        self.md_edit_vadj = self.md_edit_scrolled.get_vadjustment()
+        self.md_preview_vadj = self.md_scrolled.get_vadjustment()
+        self.md_edit_vadj.connect("value-changed", self._on_md_edit_scroll_changed)
+        self.md_preview_vadj.connect("value-changed", self._on_md_preview_scroll_changed)
+
+        self.md_outer = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
-            halign=Gtk.Align.CENTER,
+            halign=Gtk.Align.FILL,
             valign=Gtk.Align.START,
-            margin_top=28,
-            margin_bottom=40,
-            margin_start=24,
-            margin_end=24
+            hexpand=True
         )
         self.md_paper_box = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
-            width_request=680
+            hexpand=True
         )
-        self.md_paper_box.add_css_class("md-paper")
-        md_outer.append(self.md_paper_box)
-        self.md_scrolled.set_child(md_outer)
+        self.md_paper_box.add_css_class("md-split-preview-box")
+        self.md_outer.append(self.md_paper_box)
+        self.md_scrolled.set_child(self.md_outer)
         self.md_paned.set_end_child(self.md_scrolled)
 
         self.viewer_stack.add_named(self.md_paned, "markdown_doc")
@@ -1025,6 +1152,31 @@ class XNotesViewerWindow(
         self._setup_drag_and_drop()
 
     # =========================================================================
+    # Synchronized Scrolling Handlers
+    # =========================================================================
+    def _on_md_edit_scroll_changed(self, adj):
+        if self._syncing_md_scroll or self.md_view_mode != "split":
+            return
+        self._syncing_md_scroll = True
+        edit_upper = adj.get_upper() - adj.get_page_size()
+        prev_upper = self.md_preview_vadj.get_upper() - self.md_preview_vadj.get_page_size()
+        if edit_upper > 0 and prev_upper > 0:
+            fraction = adj.get_value() / edit_upper
+            self.md_preview_vadj.set_value(fraction * prev_upper)
+        self._syncing_md_scroll = False
+
+    def _on_md_preview_scroll_changed(self, adj):
+        if self._syncing_md_scroll or self.md_view_mode != "split":
+            return
+        self._syncing_md_scroll = True
+        prev_upper = adj.get_upper() - adj.get_page_size()
+        edit_upper = self.md_edit_vadj.get_upper() - self.md_edit_vadj.get_page_size()
+        if prev_upper > 0 and edit_upper > 0:
+            fraction = adj.get_value() / prev_upper
+            self.md_edit_vadj.set_value(fraction * edit_upper)
+        self._syncing_md_scroll = False
+
+    # =========================================================================
     # Custom Icon Resolver
     # =========================================================================
     def _resolve_icon_name(self, custom_name, fallback_name):
@@ -1032,6 +1184,30 @@ class XNotesViewerWindow(
         if os.path.isfile(svg_file) or self.icon_theme.has_icon(custom_name):
             return custom_name
         return fallback_name
+
+    # =========================================================================
+    # Unified Undo / Redo Handlers (.xnote Canvas + Markdown Editor)
+    # =========================================================================
+    def on_undo_activated(self, *_):
+        if self.current_file_type == "md":
+            if self.md_buffer.get_can_undo():
+                self.md_buffer.undo()
+                self._sync_md_undo_redo_buttons()
+        else:
+            self.canvas.undo()
+
+    def on_redo_activated(self, *_):
+        if self.current_file_type == "md":
+            if self.md_buffer.get_can_redo():
+                self.md_buffer.redo()
+                self._sync_md_undo_redo_buttons()
+        else:
+            self.canvas.redo()
+
+    def _sync_md_undo_redo_buttons(self):
+        if self.current_file_type == "md":
+            self.undo_btn.set_sensitive(self.md_buffer.get_can_undo())
+            self.redo_btn.set_sensitive(self.md_buffer.get_can_redo())
 
     # =========================================================================
     # Fit Page Width & PDF Import / Export Callbacks
@@ -1117,12 +1293,39 @@ class XNotesViewerWindow(
             self.show_error(f"Failed to import image: {e}")
 
     # =========================================================================
-    # Markdown Editing & Formatting Callbacks
+    # Markdown Editing, Formatting, Shortcuts & Find in Page Callbacks
     # =========================================================================
+    def _iter_at_line(self, line_num: int) -> Gtk.TextIter:
+        """Unpack PyGObject's (found, Gtk.TextIter) _ResultTuple from get_iter_at_line."""
+        res = self.md_buffer.get_iter_at_line(line_num)
+        return res[1] if isinstance(res, tuple) else res
+
+    def _apply_md_preview_layout_style(self, mode):
+        if mode == "preview":
+            self.md_outer.set_halign(Gtk.Align.CENTER)
+            self.md_outer.set_margin_top(28)
+            self.md_outer.set_margin_bottom(40)
+            self.md_outer.set_margin_start(24)
+            self.md_outer.set_margin_end(24)
+            self.md_paper_box.remove_css_class("md-split-preview-box")
+            self.md_paper_box.add_css_class("md-paper")
+            self.md_paper_box.set_size_request(int(680 * self.canvas.zoom_level), -1)
+        else:
+            self.md_outer.set_halign(Gtk.Align.FILL)
+            self.md_outer.set_margin_top(0)
+            self.md_outer.set_margin_bottom(0)
+            self.md_outer.set_margin_start(0)
+            self.md_outer.set_margin_end(0)
+            self.md_paper_box.remove_css_class("md-paper")
+            self.md_paper_box.add_css_class("md-split-preview-box")
+            self.md_paper_box.set_size_request(-1, -1)
+
     def _on_md_mode_toggled(self, btn, mode):
         if not btn.get_active():
             return
         self.md_view_mode = mode
+        self._apply_md_preview_layout_style(mode)
+
         if mode == "preview":
             self.md_edit_scrolled.set_visible(False)
             self.md_scrolled.set_visible(True)
@@ -1132,8 +1335,12 @@ class XNotesViewerWindow(
         else:
             self.md_edit_scrolled.set_visible(True)
             self.md_scrolled.set_visible(True)
-            win_w = self.get_width() or 1180
-            self.md_paned.set_position(int(win_w * 0.46))
+            win_w = self.get_width() or 1200
+            self.md_paned.set_position(int(win_w * 0.50))
+
+    def _on_md_inline_render_toggled(self, btn):
+        self.md_inline_styler.inline_render = btn.get_active()
+        self.md_inline_styler.refresh()
 
     def _on_md_buffer_changed(self, buffer):
         if self._loading_md_buffer:
@@ -1143,29 +1350,436 @@ class XNotesViewerWindow(
         MarkdownRenderer.populate_box(
             self.md_paper_box, self.markdown_content, self.canvas.zoom_level
         )
+        if self.md_search_bar.get_search_mode():
+            self._update_md_search_matches(scroll_to_current=False)
+        self._sync_md_undo_redo_buttons()
         self._on_canvas_modified(True)
 
-    def _on_md_format_clicked(self, btn, prefix, suffix):
-        if not self.md_edit_scrolled.get_visible():
-            self.md_split_btn.set_active(True)
-
+    def _toggle_line_block_format(self, prefix: str):
         buf = self.md_buffer
         bounds = buf.get_selection_bounds()
         if bounds:
+            start_iter, end_iter = bounds
+            if end_iter.starts_line() and end_iter.get_line() > start_iter.get_line():
+                end_iter.backward_char()
+        else:
+            insert_mark = buf.get_insert()
+            start_iter = buf.get_iter_at_mark(insert_mark)
+            end_iter = start_iter.copy()
+
+        start_line = start_iter.get_line()
+        end_line = end_iter.get_line()
+
+        block_start = self._iter_at_line(start_line)
+        block_end = self._iter_at_line(end_line)
+        if not block_end.ends_line():
+            block_end.forward_to_line_end()
+
+        raw_block = buf.get_text(block_start, block_end, False)
+        lines = raw_block.split("\n")
+        non_empty_lines = [ln for ln in lines if ln.strip()]
+
+        is_ordered = (prefix == "1. ")
+        is_task = (prefix == "- [ ] ")
+
+        def line_has_target_prefix(ln: str) -> bool:
+            if is_ordered:
+                return bool(re.match(r'^\s*\d+\.\s+', ln))
+            if is_task:
+                return bool(re.match(r'^\s*[-*+]\s+\[[ xX]\]\s+', ln))
+            return bool(re.match(r'^\s*' + re.escape(prefix), ln))
+
+        def strip_existing_block_prefix(ln: str) -> tuple[str, str]:
+            m_indent = re.match(r'^(\s*)', ln)
+            indent = m_indent.group(1) if m_indent else ""
+            rest = ln[len(indent):]
+            for pat in (
+                r'^[-*+]\s+\[[ xX]\]\s+',
+                r'^[-*+]\s+',
+                r'^\d+\.\s+',
+                r'^#{1,6}\s+',
+                r'^>\s?',
+            ):
+                m = re.match(pat, rest)
+                if m:
+                    return indent, rest[m.end():]
+            return indent, rest
+
+        all_already_formatted = bool(non_empty_lines) and all(
+            line_has_target_prefix(ln) for ln in non_empty_lines
+        )
+
+        new_lines = []
+        num_counter = 1
+        for ln in lines:
+            if not ln.strip() and len(lines) > 1:
+                new_lines.append(ln)
+                continue
+
+            if all_already_formatted:
+                if is_ordered:
+                    new_lines.append(re.sub(r'^(\s*)\d+\.\s+', r'\1', ln, count=1))
+                elif is_task:
+                    new_lines.append(re.sub(r'^(\s*)[-*+]\s+\[[ xX]\]\s+', r'\1', ln, count=1))
+                else:
+                    new_lines.append(re.sub(r'^(\s*)' + re.escape(prefix), r'\1', ln, count=1))
+            else:
+                indent, stripped_body = strip_existing_block_prefix(ln)
+                if is_ordered:
+                    new_lines.append(f"{indent}{num_counter}. {stripped_body}")
+                    num_counter += 1
+                else:
+                    new_lines.append(f"{indent}{prefix}{stripped_body}")
+
+        replacement = "\n".join(new_lines)
+        buf.begin_user_action()
+        buf.delete(block_start, block_end)
+        insert_pos = self._iter_at_line(start_line)
+        buf.insert(insert_pos, replacement, len(replacement.encode("utf-8")))
+        buf.end_user_action()
+
+        if bounds and start_line != end_line:
+            new_start = self._iter_at_line(start_line)
+            new_end = self._iter_at_line(end_line)
+            if not new_end.ends_line():
+                new_end.forward_to_line_end()
+            buf.select_range(new_start, new_end)
+
+    def _on_md_format_clicked(self, btn, prefix, suffix):
+        if not self.md_edit_scrolled.get_visible():
+            self.md_edit_btn.set_active(True)
+
+        buf = self.md_buffer
+
+        if suffix == "" and not prefix.startswith("\n"):
+            self._toggle_line_block_format(prefix)
+            self.md_textview.grab_focus()
+            return
+
+        bounds = buf.get_selection_bounds()
+        if bounds:
             start, end = bounds
+            start_offset = start.get_offset()
             selected_text = buf.get_text(start, end, False)
-            replacement = f"{prefix}{selected_text}{suffix}"
+
+            already_inside = (
+                selected_text.startswith(prefix)
+                and selected_text.endswith(suffix)
+                and len(selected_text) >= len(prefix) + len(suffix)
+            )
+
+            outer_start = start.copy()
+            outer_end = end.copy()
+            has_outer = (
+                outer_start.backward_chars(len(prefix))
+                and outer_end.forward_chars(len(suffix))
+                and buf.get_text(outer_start, start, False) == prefix
+                and buf.get_text(end, outer_end, False) == suffix
+            )
+
             buf.begin_user_action()
-            buf.delete(start, end)
-            buf.insert_at_cursor(replacement, len(replacement.encode('utf-8')))
+            if already_inside:
+                replacement = selected_text[len(prefix):len(selected_text) - len(suffix)]
+                buf.delete(start, end)
+                ins_iter = buf.get_iter_at_offset(start_offset)
+                buf.insert(ins_iter, replacement, len(replacement.encode("utf-8")))
+                s_it = buf.get_iter_at_offset(start_offset)
+                e_it = buf.get_iter_at_offset(start_offset + len(replacement))
+                buf.select_range(s_it, e_it)
+            elif has_outer:
+                outer_offset = outer_start.get_offset()
+                buf.delete(outer_start, outer_end)
+                ins_iter = buf.get_iter_at_offset(outer_offset)
+                buf.insert(ins_iter, selected_text, len(selected_text.encode("utf-8")))
+                s_it = buf.get_iter_at_offset(outer_offset)
+                e_it = buf.get_iter_at_offset(outer_offset + len(selected_text))
+                buf.select_range(s_it, e_it)
+            else:
+                if "\n" in selected_text and prefix in ("**", "*", "~~", "`"):
+                    lines = selected_text.split("\n")
+                    non_empty = [ln for ln in lines if ln.strip()]
+                    all_wrapped = bool(non_empty) and all(
+                        ln.strip().startswith(prefix) and ln.strip().endswith(suffix)
+                        and len(ln.strip()) >= len(prefix) + len(suffix)
+                        for ln in non_empty
+                    )
+                    processed = []
+                    for ln in lines:
+                        if not ln.strip():
+                            processed.append(ln)
+                        elif all_wrapped:
+                            m = re.match(r'^(\s*)(.*?)(\s*)$', ln)
+                            lead, core, trail = m.group(1), m.group(2), m.group(3)
+                            core_unwrapped = core[len(prefix):len(core) - len(suffix)]
+                            processed.append(f"{lead}{core_unwrapped}{trail}")
+                        else:
+                            m = re.match(r'^(\s*)(.*?)(\s*)$', ln)
+                            lead, core, trail = m.group(1), m.group(2), m.group(3)
+                            processed.append(f"{lead}{prefix}{core}{suffix}{trail}")
+                    replacement = "\n".join(processed)
+                else:
+                    replacement = f"{prefix}{selected_text}{suffix}"
+
+                buf.delete(start, end)
+                ins_iter = buf.get_iter_at_offset(start_offset)
+                buf.insert(ins_iter, replacement, len(replacement.encode("utf-8")))
+                s_it = buf.get_iter_at_offset(start_offset)
+                e_it = buf.get_iter_at_offset(start_offset + len(replacement))
+                buf.select_range(s_it, e_it)
             buf.end_user_action()
         else:
             placeholder = "text" if suffix else ""
             snippet = f"{prefix}{placeholder}{suffix}"
             buf.begin_user_action()
-            buf.insert_at_cursor(snippet, len(snippet.encode('utf-8')))
+            buf.insert_at_cursor(snippet, len(snippet.encode("utf-8")))
             buf.end_user_action()
+            if suffix and placeholder:
+                insert_iter = buf.get_iter_at_mark(buf.get_insert())
+                sel_end = insert_iter.copy()
+                sel_end.backward_chars(len(suffix))
+                sel_start = sel_end.copy()
+                sel_start.backward_chars(len(placeholder))
+                buf.select_range(sel_start, sel_end)
+
         self.md_textview.grab_focus()
+
+    def _handle_md_return_key(self) -> bool:
+        buf = self.md_buffer
+        if buf.get_selection_bounds():
+            return False
+
+        insert_mark = buf.get_insert()
+        cursor_iter = buf.get_iter_at_mark(insert_mark)
+
+        line_start = cursor_iter.copy()
+        line_start.set_line_offset(0)
+        line_end = line_start.copy()
+        if not line_end.ends_line():
+            line_end.forward_to_line_end()
+
+        full_line = buf.get_text(line_start, line_end, False)
+        text_before_cursor = buf.get_text(line_start, cursor_iter, False)
+
+        task_match = re.match(r'^(\s*)([-*+])\s+\[([ xX])\]\s+(.*)$', full_line)
+        if task_match:
+            indent, bullet, _state, content = task_match.groups()
+            if not content.strip():
+                buf.begin_user_action()
+                buf.delete(line_start, line_end)
+                buf.end_user_action()
+                return True
+            if len(text_before_cursor) >= len(full_line) - len(content):
+                continuation = f"\n{indent}{bullet} [ ] "
+                buf.begin_user_action()
+                buf.insert_at_cursor(continuation, len(continuation.encode("utf-8")))
+                buf.end_user_action()
+                self.md_textview.scroll_mark_onscreen(buf.get_insert())
+                return True
+
+        ul_match = re.match(r'^(\s*)([-*+])\s+(.*)$', full_line)
+        if ul_match:
+            indent, bullet, content = ul_match.groups()
+            if not content.strip():
+                buf.begin_user_action()
+                buf.delete(line_start, line_end)
+                buf.end_user_action()
+                return True
+            if len(text_before_cursor) >= len(full_line) - len(content):
+                continuation = f"\n{indent}{bullet} "
+                buf.begin_user_action()
+                buf.insert_at_cursor(continuation, len(continuation.encode("utf-8")))
+                buf.end_user_action()
+                self.md_textview.scroll_mark_onscreen(buf.get_insert())
+                return True
+
+        ol_match = re.match(r'^(\s*)(\d+)\.\s+(.*)$', full_line)
+        if ol_match:
+            indent, num_str, content = ol_match.groups()
+            if not content.strip():
+                buf.begin_user_action()
+                buf.delete(line_start, line_end)
+                buf.end_user_action()
+                return True
+            if len(text_before_cursor) >= len(full_line) - len(content):
+                next_num = int(num_str) + 1
+                continuation = f"\n{indent}{next_num}. "
+                buf.begin_user_action()
+                buf.insert_at_cursor(continuation, len(continuation.encode("utf-8")))
+                buf.end_user_action()
+                self.md_textview.scroll_mark_onscreen(buf.get_insert())
+                return True
+
+        return False
+
+    def _on_md_key_pressed(self, controller, keyval, keycode, state):
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        alt = bool(state & Gdk.ModifierType.ALT_MASK)
+
+        if keyval == Gdk.KEY_Escape and self.md_search_bar.get_search_mode():
+            self.md_find_btn.set_active(False)
+            self.md_textview.grab_focus()
+            return True
+
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and not ctrl and not shift and not alt:
+            if self._handle_md_return_key():
+                return True
+
+        if not ctrl:
+            return False
+
+        key_name = Gdk.keyval_name(keyval)
+        if not key_name:
+            return False
+        key_lower = key_name.lower()
+
+        if key_lower == "z" and not shift:
+            if self.md_buffer.get_can_undo():
+                self.md_buffer.undo()
+                self._sync_md_undo_redo_buttons()
+            return True
+
+        if (key_lower == "y" and not shift) or (key_lower == "z" and shift):
+            if self.md_buffer.get_can_redo():
+                self.md_buffer.redo()
+                self._sync_md_undo_redo_buttons()
+            return True
+
+        if key_lower == "c" and not shift:
+            clipboard = self.get_clipboard()
+            self.md_buffer.copy_clipboard(clipboard)
+            return True
+
+        if key_lower == "x" and not shift:
+            clipboard = self.get_clipboard()
+            self.md_buffer.cut_clipboard(clipboard, self.md_textview.get_editable())
+            return True
+
+        if key_lower == "v" and not shift:
+            clipboard = self.get_clipboard()
+            self.md_buffer.paste_clipboard(clipboard, None, self.md_textview.get_editable())
+            return True
+
+        if key_lower == "f" and not shift:
+            self.md_find_btn.set_active(True)
+            self.md_search_entry.grab_focus()
+            return True
+
+        if key_lower == "b" and not shift:
+            self._on_md_format_clicked(None, "**", "**")
+            return True
+
+        if key_lower == "i" and not shift:
+            self._on_md_format_clicked(None, "*", "*")
+            return True
+
+        if key_lower == "x" and shift:
+            self._on_md_format_clicked(None, "~~", "~~")
+            return True
+
+        if (key_lower == "e" and not shift) or key_lower in ("grave", "asciitilde"):
+            self._on_md_format_clicked(None, "`", "`")
+            return True
+
+        if key_lower == "k" and not shift:
+            self._on_md_format_clicked(None, "[", "](https://)")
+            return True
+
+        if key_lower == "q" and shift:
+            self._on_md_format_clicked(None, "> ", "")
+            return True
+
+        if key_lower == "l" and shift:
+            self._on_md_format_clicked(None, "- ", "")
+            return True
+
+        if key_lower in ("1", "2", "3") and not shift:
+            level = int(key_lower)
+            self._on_md_format_clicked(None, "#" * level + " ", "")
+            return True
+
+        return False
+
+    def _on_md_find_toggled(self, btn):
+        active = btn.get_active()
+        self.md_search_bar.set_search_mode(active)
+        if active:
+            bounds = self.md_buffer.get_selection_bounds()
+            if bounds:
+                sel_text = self.md_buffer.get_text(bounds[0], bounds[1], False)
+                if sel_text and "\n" not in sel_text:
+                    self.md_search_entry.set_text(sel_text)
+            self.md_search_entry.grab_focus()
+            self._update_md_search_matches(scroll_to_current=True)
+        else:
+            self._clear_md_search_tags()
+            self.md_search_count_lbl.set_label("")
+            if self.current_file_type == "md":
+                self.md_textview.grab_focus()
+
+    def _on_md_search_bar_mode_notify(self, search_bar, _pspec):
+        enabled = search_bar.get_search_mode()
+        if self.md_find_btn.get_active() != enabled:
+            self.md_find_btn.set_active(enabled)
+
+    def _clear_md_search_tags(self):
+        start, end = self.md_buffer.get_bounds()
+        self.md_buffer.remove_tag_by_name("md-search-match", start, end)
+        self.md_buffer.remove_tag_by_name("md-search-current", start, end)
+
+    def _on_md_search_changed(self, _entry):
+        self._update_md_search_matches(scroll_to_current=True)
+
+    def _update_md_search_matches(self, scroll_to_current=True):
+        self._clear_md_search_tags()
+        self.md_search_matches.clear()
+
+        query = self.md_search_entry.get_text()
+        if not query:
+            self.md_search_idx = -1
+            self.md_search_count_lbl.set_label("")
+            return
+
+        start, end = self.md_buffer.get_bounds()
+        full_text = self.md_buffer.get_text(start, end, True)
+
+        for m in re.finditer(re.escape(query), full_text, re.IGNORECASE):
+            self.md_search_matches.append((m.start(), m.end()))
+
+        total = len(self.md_search_matches)
+        if total == 0:
+            self.md_search_idx = -1
+            self.md_search_count_lbl.set_label("0 results")
+            return
+
+        if self.md_search_idx < 0 or self.md_search_idx >= total:
+            self.md_search_idx = 0
+
+        self._highlight_md_search_matches(scroll_to_current=scroll_to_current)
+
+    def _highlight_md_search_matches(self, scroll_to_current=True):
+        self._clear_md_search_tags()
+        total = len(self.md_search_matches)
+        if total == 0:
+            self.md_search_count_lbl.set_label("0 results")
+            return
+
+        for idx, (s_off, e_off) in enumerate(self.md_search_matches):
+            s_iter = self.md_buffer.get_iter_at_offset(s_off)
+            e_iter = self.md_buffer.get_iter_at_offset(e_off)
+            tag = "md-search-current" if idx == self.md_search_idx else "md-search-match"
+            self.md_buffer.apply_tag_by_name(tag, s_iter, e_iter)
+            if idx == self.md_search_idx and scroll_to_current:
+                self.md_textview.scroll_to_iter(s_iter, 0.15, False, 0.0, 0.5)
+
+        self.md_search_count_lbl.set_label(f"{self.md_search_idx + 1} of {total}")
+
+    def _step_md_search(self, delta: int):
+        total = len(self.md_search_matches)
+        if total == 0:
+            return
+        self.md_search_idx = (self.md_search_idx + delta) % total
+        self._highlight_md_search_matches(scroll_to_current=True)
 
     # =========================================================================
     # Stylus Toolbar Callbacks & Live Lasso Recoloring
@@ -1221,9 +1835,10 @@ class XNotesViewerWindow(
             self._queue_redraw_current_sidebar_thumb()
 
     def _on_history_changed(self, can_undo, can_redo):
-        self.undo_btn.set_sensitive(can_undo)
-        self.redo_btn.set_sensitive(can_redo)
-        self._queue_redraw_current_sidebar_thumb()
+        if self.current_file_type != "md":
+            self.undo_btn.set_sensitive(can_undo)
+            self.redo_btn.set_sensitive(can_redo)
+            self._queue_redraw_current_sidebar_thumb()
 
     def on_add_page_clicked(self, *args):
         if not self.canvas.document:
@@ -1401,8 +2016,8 @@ class XNotesViewerWindow(
             ("export-pdf", self.on_export_pdf_clicked),
             ("new-markdown", self.on_new_markdown_clicked),
             ("save", self.on_save_clicked),
-            ("undo", lambda *_: self.canvas.undo() if self.current_file_type != "md" else None),
-            ("redo", lambda *_: self.canvas.redo() if self.current_file_type != "md" else None),
+            ("undo", self.on_undo_activated),
+            ("redo", self.on_redo_activated),
             ("zoom-in", lambda *_: self.set_zoom(self.canvas.zoom_level + 0.25)),
             ("zoom-out", lambda *_: self.set_zoom(self.canvas.zoom_level - 0.25)),
             ("zoom-reset", lambda *_: self.set_zoom(1.0)),
@@ -1430,6 +2045,8 @@ class XNotesViewerWindow(
     def on_find_shortcut(self, *args):
         if self.root_stack.get_visible_child_name() == "collection":
             self.search_btn.set_active(not self.search_btn.get_active())
+        elif self.root_stack.get_visible_child_name() == "viewer" and self.current_file_type == "md":
+            self.md_find_btn.set_active(not self.md_find_btn.get_active())
 
     def on_search_toggled(self, btn):
         active = btn.get_active()
@@ -1444,12 +2061,12 @@ class XNotesViewerWindow(
 
     def on_toggle_view_mode_action(self, *args):
         if self.current_file_type == "md":
-            if self.md_view_mode == "preview":
+            if self.md_view_mode == "edit":
                 self.md_split_btn.set_active(True)
             elif self.md_view_mode == "split":
-                self.md_edit_btn.set_active(True)
-            else:
                 self.md_preview_btn.set_active(True)
+            else:
+                self.md_edit_btn.set_active(True)
             return
         if self.current_file_type not in ("xnote", "xcanvas", "xtemplate") or not self.canvas.document:
             return
@@ -1524,6 +2141,7 @@ class XNotesViewerWindow(
         return False
 
     def _perform_return_to_collection(self):
+        self.md_find_btn.set_active(False)
         self.canvas.clear_selection()
         self.canvas.page_cache.clear()
         self.canvas.assets.clear()
@@ -1607,17 +2225,26 @@ class XNotesViewerWindow(
             self.canvas.zoom_level = 1.0
 
             self._loading_md_buffer = True
+            self.md_buffer.begin_irreversible_action()
             self.md_buffer.set_text(self.markdown_content)
+            self.md_buffer.end_irreversible_action()
             self._loading_md_buffer = False
+            self.md_inline_styler.refresh()
 
             self._on_canvas_modified(False)
+            self._sync_md_undo_redo_buttons()
 
             MarkdownRenderer.populate_box(
                 self.md_paper_box, self.markdown_content, self.canvas.zoom_level
             )
 
+            self.md_edit_btn.set_active(True)
+            self._apply_md_preview_layout_style("edit")
+            self.md_edit_scrolled.set_visible(True)
+            self.md_scrolled.set_visible(False)
+
             self.window_title.set_title(os.path.splitext(os.path.basename(path))[0])
-            self.window_title.set_subtitle("Markdown")
+            self.window_title.set_subtitle("")
             self.viewer_stack.set_visible_child_name("markdown_doc")
             self.page_sidebar_btn.set_visible(False)
             self.mode_box.set_visible(False)
@@ -1625,14 +2252,16 @@ class XNotesViewerWindow(
             self.md_toolbar_bar.set_visible(True)
             self.save_btn.set_visible(True)
             self.export_pdf_btn.set_visible(False)
-            self.history_box.set_visible(False)
+            self.history_box.set_visible(True)
             self.zoom_reset_btn.set_label("100%")
             self.root_stack.set_visible_child_name("viewer")
+            self.md_textview.grab_focus()
         except Exception as e:
             self.show_error(f"Failed to load Markdown file {os.path.basename(path)}: {e}")
 
     def _load_xnote_document(self, path, ext):
         try:
+            self.md_find_btn.set_active(False)
             self.canvas.clear_selection()
             self.canvas.assets.clear()
             self.canvas.templates.clear()
@@ -1750,7 +2379,8 @@ class XNotesViewerWindow(
             self.canvas.zoom_level = new_zoom
             self.zoom_reset_btn.set_label(f"{int(self.canvas.zoom_level * 100)}%")
             if self.current_file_type == "md":
-                self.md_paper_box.set_size_request(int(680 * self.canvas.zoom_level), -1)
+                if self.md_view_mode == "preview":
+                    self.md_paper_box.set_size_request(int(680 * self.canvas.zoom_level), -1)
                 MarkdownRenderer.populate_box(
                     self.md_paper_box, self.markdown_content, self.canvas.zoom_level
                 )
