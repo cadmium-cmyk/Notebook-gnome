@@ -516,6 +516,37 @@ class XNotesViewerWindow(
 
         viewer_header.pack_end(self.zoom_box)
 
+        # Markdown View Mode Switcher (Editor default, Split, Preview) in Headerbar
+        self.md_mode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        self.md_mode_box.add_css_class("linked")
+        self.md_mode_box.set_visible(False)
+
+        self.md_edit_btn = Gtk.ToggleButton(
+            icon_name=self._resolve_icon_name("document-edit-symbolic", "accessories-text-editor-symbolic"),
+            active=True,
+            tooltip_text="Markdown Editor View (Ctrl+M)"
+        )
+        self.md_edit_btn.connect("toggled", self._on_md_mode_toggled, "edit")
+        self.md_mode_box.append(self.md_edit_btn)
+
+        self.md_split_btn = Gtk.ToggleButton(
+            icon_name="view-dual-symbolic",
+            group=self.md_edit_btn,
+            tooltip_text="Side-by-Side Split View (Ctrl+M)"
+        )
+        self.md_split_btn.connect("toggled", self._on_md_mode_toggled, "split")
+        self.md_mode_box.append(self.md_split_btn)
+
+        self.md_preview_btn = Gtk.ToggleButton(
+            icon_name="view-reveal-symbolic",
+            group=self.md_edit_btn,
+            tooltip_text="Formatted Paper Preview (Ctrl+M)"
+        )
+        self.md_preview_btn.connect("toggled", self._on_md_mode_toggled, "preview")
+        self.md_mode_box.append(self.md_preview_btn)
+
+        viewer_header.pack_end(self.md_mode_box)
+
         # View Mode toggle controls (Paged vs Scrolled for .xnote)
         self.mode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         self.mode_box.add_css_class("linked")
@@ -788,35 +819,6 @@ class XNotesViewerWindow(
         )
         self.md_toolbar_bar.add_css_class("stylus-toolbar")
 
-        # Start widget: View Mode Switcher (Editor default, Split, Preview)
-        md_mode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        md_mode_box.add_css_class("linked")
-
-        self.md_edit_btn = Gtk.ToggleButton(
-            icon_name=self._resolve_icon_name("document-edit-symbolic", "accessories-text-editor-symbolic"),
-            active=True,
-            tooltip_text="Markdown Editor View (Ctrl+M)"
-        )
-        self.md_edit_btn.connect("toggled", self._on_md_mode_toggled, "edit")
-        md_mode_box.append(self.md_edit_btn)
-
-        self.md_split_btn = Gtk.ToggleButton(
-            icon_name="view-dual-symbolic",
-            group=self.md_edit_btn,
-            tooltip_text="Side-by-Side Split View (Ctrl+M)"
-        )
-        self.md_split_btn.connect("toggled", self._on_md_mode_toggled, "split")
-        md_mode_box.append(self.md_split_btn)
-
-        self.md_preview_btn = Gtk.ToggleButton(
-            icon_name="view-reveal-symbolic",
-            group=self.md_edit_btn,
-            tooltip_text="Formatted Paper Preview (Ctrl+M)"
-        )
-        self.md_preview_btn.connect("toggled", self._on_md_mode_toggled, "preview")
-        md_mode_box.append(self.md_preview_btn)
-
-        self.md_toolbar_bar.set_start_widget(md_mode_box)
 
         # Center widget: Symbolic Formatting Toolbar + Find in Page button
         center_fmt_wrap = Gtk.Box(
@@ -2225,6 +2227,7 @@ class XNotesViewerWindow(
             self.viewer_stack.set_visible_child_name("markdown_doc")
             self.page_sidebar_btn.set_visible(False)
             self.mode_box.set_visible(False)
+            self.md_mode_box.set_visible(True)
             self.stylus_bar.set_visible(False)
             self.md_toolbar_bar.set_visible(True)
             self.save_btn.set_visible(True)
@@ -2274,6 +2277,7 @@ class XNotesViewerWindow(
             self.page_sidebar_revealer.set_reveal_child(False)
 
             self.mode_box.set_visible(True)
+            self.md_mode_box.set_visible(False)
             self.md_toolbar_bar.set_visible(False)
             self.stylus_bar.set_visible(is_editable)
             self.save_btn.set_visible(is_editable)
