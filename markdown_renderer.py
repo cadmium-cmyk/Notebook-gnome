@@ -27,6 +27,13 @@ class MarkdownInlineStyler:
         self._last_cursor_line = -1
 
         self._setup_tags()
+        try:
+            gi.require_version("Adw", "1")
+            from gi.repository import Adw
+            if Adw.StyleManager.get_default().get_dark():
+                self.update_theme_colors(True)
+        except Exception:
+            pass
 
         self.buffer.connect("changed", self._on_buffer_changed)
         self.buffer.connect("mark-set", self._on_mark_set)
@@ -116,6 +123,59 @@ class MarkdownInlineStyler:
             "md-link-label", "md-link-url",
         ]
 
+    def update_theme_colors(self, is_dark: bool):
+        table = self.buffer.get_tag_table()
+        fg_heading = "#f0f6fc" if is_dark else "#24292f"
+        fg_syntax = "#8b949e" if is_dark else "#6e7781"
+        code_bg = "#2b3036" if is_dark else "#eaeef2"
+        code_fg = "#ff7b72" if is_dark else "#c01c28"
+        block_bg = "#1e2227" if is_dark else "#f4f4f6"
+        block_fg = "#e6edf3" if is_dark else "#1e1e1e"
+        quote_fg = "#a5d6ff" if is_dark else "#57606a"
+        quote_bg = "#58a6ff1a" if is_dark else "#3584e410"
+        strike_fg = "#8b949e" if is_dark else "#77767b"
+        link_fg = "#58a6ff" if is_dark else "#1c71d8"
+        list_fg = "#8b949e" if is_dark else "#57606a"
+        task_fg = "#3fb950" if is_dark else "#26a269"
+        hr_fg = "#484f58" if is_dark else "#9a9996"
+        keyword_fg = "#d2a8ff" if is_dark else "#813d9c"
+        string_fg = "#7ee787" if is_dark else "#26a269"
+        comment_fg = "#8b949e" if is_dark else "#77767b"
+        search_bg = "#735c0f" if is_dark else "#f9f06b"
+        search_fg = "#f0f6fc" if is_dark else "#1e1e1e"
+
+        color_map = [
+            ("md-syntax", "foreground", fg_syntax),
+            ("md-h1", "foreground", fg_heading),
+            ("md-h2", "foreground", fg_heading),
+            ("md-h3", "foreground", fg_heading),
+            ("md-h4", "foreground", fg_heading),
+            ("md-bold", "foreground", fg_heading),
+            ("md-strike", "foreground", strike_fg),
+            ("md-inline-code", "background", code_bg),
+            ("md-inline-code", "foreground", code_fg),
+            ("md-code-block", "background", block_bg),
+            ("md-code-block", "paragraph_background", block_bg),
+            ("md-code-block", "foreground", block_fg),
+            ("md-code-keyword", "foreground", keyword_fg),
+            ("md-code-string", "foreground", string_fg),
+            ("md-code-comment", "foreground", comment_fg),
+            ("md-quote", "foreground", quote_fg),
+            ("md-quote", "paragraph_background", quote_bg),
+            ("md-list-marker", "foreground", list_fg),
+            ("md-task-done", "foreground", task_fg),
+            ("md-hr", "foreground", hr_fg),
+            ("md-link-label", "foreground", link_fg),
+            ("md-link-url", "foreground", fg_syntax),
+            ("md-search-match", "background", search_bg),
+            ("md-search-match", "foreground", search_fg),
+        ]
+        for name, prop, val in color_map:
+            tag = table.lookup(name)
+            if tag:
+                tag.set_property(prop, val)
+        if hasattr(self, "refresh") and hasattr(self, "managed_tags"):
+            self.refresh()
     def _get_cursor_line(self) -> int:
         insert_mark = self.buffer.get_insert()
         it = self.buffer.get_iter_at_mark(insert_mark)
@@ -302,21 +362,32 @@ class MarkdownRenderer:
     """Helper to convert Markdown text into styled GTK4 widgets and rich Cairo thumbnails."""
 
     @staticmethod
-    def inline_to_pango(text):
+    def inline_to_pango(text, is_dark=None):
+        if is_dark is None:
+            try:
+                import gi
+                gi.require_version("Adw", "1")
+                from gi.repository import Adw
+                is_dark = Adw.StyleManager.get_default().get_dark()
+            except Exception:
+                is_dark = False
         escaped = html.escape(text, quote=False)
 
         code_spans = []
         def save_code(match):
             idx = len(code_spans)
+            code_bg = "#2b3036" if is_dark else "#e8e8e8"
+            code_fg = "#ff7b72" if is_dark else "#1f1f1f"
             code_spans.append(
-                f'<tt><span background="#e8e8e8" foreground="#1f1f1f"> {match.group(1)} </span></tt>'
+                f'<tt><span background="{code_bg}" foreground="{code_fg}"> {match.group(1)} </span></tt>'
             )
             return f"\x00CODESPAN{idx}\x00"
 
         escaped = re.sub(r'`([^`]+)`', save_code, escaped)
+        link_fg = "#62a0ea" if is_dark else "#1c71d8"
         escaped = re.sub(
             r'\[([^\]]+)\]\(([^)]+)\)',
-            r'<span foreground="#1c71d8" underline="single">\1</span>',
+            rf'<span foreground="{link_fg}" underline="single">\1</span>',
             escaped
         )
         escaped = re.sub(r'\*\*\*(.+?)\*\*\*', r'<b><i>\1</i></b>', escaped)
@@ -358,7 +429,7 @@ class MarkdownRenderer:
             markup = cls.inline_to_pango(joined)
             pt = max(8, int(11.5 * zoom_level))
             try:
-                lbl.set_markup(f'<span size="{pt * 1024}" foreground="#2e3436">{markup}</span>')
+                lbl.set_markup(f'<span size="{pt * 1024}">{markup}</span>')
             except Exception:
                 lbl.set_text(joined)
             lbl.set_margin_bottom(int(10 * zoom_level))
@@ -433,7 +504,7 @@ class MarkdownRenderer:
                 )
                 try:
                     lbl.set_markup(
-                        f'<span size="{pt * 1024}" weight="bold" foreground="#2e3436">{content}</span>'
+                        f'<span size="{pt * 1024}" weight="bold">{content}</span>'
                     )
                 except Exception:
                     lbl.set_text(heading_match.group(2))
@@ -489,7 +560,7 @@ class MarkdownRenderer:
 
                 pt = max(8, int(11.5 * zoom_level))
                 b_lbl = Gtk.Label(valign=Gtk.Align.START)
-                b_lbl.set_markup(f'<span size="{pt * 1024}" foreground="#2e3436"><b>{bullet}</b></span>')
+                b_lbl.set_markup(f'<span size="{pt * 1024}"><b>{bullet}</b></span>')
                 row.append(b_lbl)
 
                 t_lbl = Gtk.Label(
@@ -501,7 +572,7 @@ class MarkdownRenderer:
                 )
                 try:
                     t_lbl.set_markup(
-                        f'<span size="{pt * 1024}" foreground="#2e3436">{cls.inline_to_pango(item_text)}</span>'
+                        f'<span size="{pt * 1024}">{cls.inline_to_pango(item_text)}</span>'
                     )
                 except Exception:
                     t_lbl.set_text(item_text)
@@ -522,7 +593,7 @@ class MarkdownRenderer:
 
                 pt = max(8, int(11.5 * zoom_level))
                 n_lbl = Gtk.Label(valign=Gtk.Align.START)
-                n_lbl.set_markup(f'<span size="{pt * 1024}" foreground="#2e3436"><b>{num}</b></span>')
+                n_lbl.set_markup(f'<span size="{pt * 1024}"><b>{num}</b></span>')
                 row.append(n_lbl)
 
                 t_lbl = Gtk.Label(
@@ -534,7 +605,7 @@ class MarkdownRenderer:
                 )
                 try:
                     t_lbl.set_markup(
-                        f'<span size="{pt * 1024}" foreground="#2e3436">{cls.inline_to_pango(item_text)}</span>'
+                        f'<span size="{pt * 1024}">{cls.inline_to_pango(item_text)}</span>'
                     )
                 except Exception:
                     t_lbl.set_text(item_text)
@@ -557,6 +628,8 @@ class MarkdownRenderer:
 
     @classmethod
     def draw_markdown_thumb(cls, cr, width, height, md_text):
+        def inline(txt):
+            return cls.inline_to_pango(txt, is_dark=False)
         """Render a miniature formatted preview of the Markdown document onto a Cairo thumbnail."""
         cr.save()
         radius = 12.0
@@ -604,7 +677,7 @@ class MarkdownRenderer:
                 return
             joined = " ".join(paragraph_lines)
             paragraph_lines.clear()
-            render_pango_block(cls.inline_to_pango(joined), joined, "Sans 6.5")
+            render_pango_block(inline(joined), joined, "Sans 6.5")
 
         for raw_line in lines:
             if y_cursor >= max_y:
@@ -665,7 +738,7 @@ class MarkdownRenderer:
                 flush_paragraph()
                 level = len(heading_match.group(1))
                 text_body = heading_match.group(2)
-                markup = f"<b>{cls.inline_to_pango(text_body)}</b>"
+                markup = f"<b>{inline(text_body)}</b>"
                 sizes = {1: "9.5", 2: "8.2", 3: "7.4", 4: "6.8", 5: "6.5", 6: "6.2"}
                 pt_str = sizes.get(level, "6.8")
                 y_cursor += 1.5
@@ -675,7 +748,7 @@ class MarkdownRenderer:
             if stripped.startswith(">"):
                 flush_paragraph()
                 q_body = stripped.lstrip(">").strip()
-                q_markup = f"<i>{cls.inline_to_pango(q_body)}</i>"
+                q_markup = f"<i>{inline(q_body)}</i>"
                 start_y = y_cursor
                 render_pango_block(q_markup, q_body, "Sans Italic 6.2", x_off=6.0, color=(0.30, 0.34, 0.40))
                 end_y = max(start_y + 6.0, y_cursor - 3.0)
@@ -698,7 +771,7 @@ class MarkdownRenderer:
                 elif item_text.lower().startswith("[x] "):
                     bullet = "☑"
                     item_text = item_text[4:]
-                markup = f"<b>{bullet}</b> {cls.inline_to_pango(item_text)}"
+                markup = f"<b>{bullet}</b> {inline(item_text)}"
                 render_pango_block(markup, f"{bullet} {item_text}", "Sans 6.3", x_off=indent * 6.0)
                 continue
 
@@ -708,7 +781,7 @@ class MarkdownRenderer:
                 indent = min(3, len(ol_match.group(1)) // 2)
                 num = ol_match.group(2)
                 item_text = ol_match.group(3)
-                markup = f"<b>{html.escape(num)}</b> {cls.inline_to_pango(item_text)}"
+                markup = f"<b>{html.escape(num)}</b> {inline(item_text)}"
                 render_pango_block(markup, f"{num} {item_text}", "Sans 6.3", x_off=indent * 6.0)
                 continue
 
@@ -732,3 +805,222 @@ class MarkdownRenderer:
         cls._rounded_rect(cr, 0, 0, width, height, radius)
         cr.stroke()
         cr.restore()
+        del inline
+
+    @classmethod
+    def export_to_pdf(cls, pdf_path: str, md_text: str, page_width: float = 612.0, page_height: float = 792.0):
+        def inline(txt):
+            return cls.inline_to_pango(txt, is_dark=False)
+        """Export the rendered Markdown document as a multi-page vector PDF."""
+        surface = cairo.PDFSurface(pdf_path, page_width, page_height)
+        cr = cairo.Context(surface)
+
+        pad_x = 54.0
+        pad_top = 54.0
+        pad_bottom = 54.0
+        avail_w = page_width - pad_x * 2.0
+        max_y = page_height - pad_bottom
+        y_cursor = pad_top
+        page_num = 1
+
+        def start_page():
+            cr.save()
+            cr.set_source_rgb(1.0, 1.0, 1.0)
+            cr.rectangle(0, 0, page_width, page_height)
+            cr.fill()
+            cr.restore()
+
+        def new_page():
+            nonlocal y_cursor, page_num
+            cr.show_page()
+            page_num += 1
+            start_page()
+            y_cursor = pad_top
+
+        start_page()
+
+        lines = md_text.splitlines()
+        in_code_block = False
+        code_lines = []
+        paragraph_lines = []
+
+        def render_pango_block(markup_str, fallback_text, font_str, x_off=0.0, color=(0.14, 0.16, 0.18), space_below=6.0):
+            nonlocal y_cursor
+            layout = PangoCairo.create_layout(cr)
+            layout.set_font_description(Pango.FontDescription.from_string(font_str))
+            layout.set_width(int(max(10.0, avail_w - x_off) * Pango.SCALE))
+            layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+            try:
+                layout.set_markup(markup_str, -1)
+            except Exception:
+                layout.set_text(fallback_text, -1)
+
+            _, logical = layout.get_pixel_extents()
+            block_h = logical.height
+
+            if y_cursor > pad_top and (y_cursor + block_h > max_y):
+                new_page()
+
+            cr.save()
+            cr.set_source_rgb(*color)
+            cr.move_to(pad_x + x_off, y_cursor)
+            PangoCairo.show_layout(cr, layout)
+            cr.restore()
+            y_cursor += block_h + space_below
+
+        def flush_paragraph():
+            nonlocal y_cursor
+            if not paragraph_lines:
+                return
+            joined = " ".join(paragraph_lines)
+            paragraph_lines.clear()
+            render_pango_block(inline(joined), joined, "Sans 11", space_below=8.0)
+
+        for raw_line in lines:
+            stripped = raw_line.strip()
+
+            if stripped.startswith("```"):
+                flush_paragraph()
+                if in_code_block:
+                    code_str = "\n".join(code_lines)
+                    code_lines.clear()
+                    in_code_block = False
+                    if code_str:
+                        layout = PangoCairo.create_layout(cr)
+                        layout.set_font_description(Pango.FontDescription.from_string("Monospace 9.5"))
+                        layout.set_width(int(max(10.0, avail_w - 20.0) * Pango.SCALE))
+                        layout.set_wrap(Pango.WrapMode.CHAR)
+                        layout.set_text(code_str, -1)
+                        _, logical = layout.get_pixel_extents()
+                        box_h = logical.height + 16.0
+
+                        if y_cursor > pad_top and (y_cursor + box_h > max_y):
+                            new_page()
+
+                        cr.save()
+                        cr.set_source_rgb(0.96, 0.97, 0.98)
+                        cls._rounded_rect(cr, pad_x, y_cursor, avail_w, box_h, 4.0)
+                        cr.fill()
+                        cr.set_source_rgba(0, 0, 0, 0.12)
+                        cr.set_line_width(0.8)
+                        cls._rounded_rect(cr, pad_x, y_cursor, avail_w, box_h, 4.0)
+                        cr.stroke()
+
+                        cr.set_source_rgb(0.18, 0.19, 0.21)
+                        cr.move_to(pad_x + 10.0, y_cursor + 8.0)
+                        PangoCairo.show_layout(cr, layout)
+                        cr.restore()
+                        y_cursor += box_h + 10.0
+                else:
+                    in_code_block = True
+                continue
+
+            if in_code_block:
+                code_lines.append(raw_line)
+                continue
+
+            if not stripped:
+                flush_paragraph()
+                continue
+
+            if stripped in ("---", "***", "___"):
+                flush_paragraph()
+                if y_cursor > pad_top and (y_cursor + 16.0 > max_y):
+                    new_page()
+                cr.save()
+                cr.set_source_rgba(0, 0, 0, 0.16)
+                cr.set_line_width(1.0)
+                cr.move_to(pad_x, y_cursor + 8.0)
+                cr.line_to(pad_x + avail_w, y_cursor + 8.0)
+                cr.stroke()
+                cr.restore()
+                y_cursor += 18.0
+                continue
+
+            heading_match = re.match(r'^(#{1,6})\s+(.*)$', stripped)
+            if heading_match:
+                flush_paragraph()
+                level = len(heading_match.group(1))
+                text_body = heading_match.group(2)
+                markup = f"<b>{inline(text_body)}</b>"
+                sizes = {
+                    1: ("19", 14.0, 8.0),
+                    2: ("15.5", 12.0, 6.0),
+                    3: ("13", 10.0, 5.0),
+                    4: ("11.5", 8.0, 4.0)
+                }
+                pt_str, m_above, m_below = sizes.get(level, ("10.5", 6.0, 3.0))
+                if y_cursor > pad_top and (y_cursor + m_above + 35 > max_y):
+                    new_page()
+                else:
+                    y_cursor += m_above
+                render_pango_block(markup, text_body, f"Sans Bold {pt_str}", color=(0.08, 0.08, 0.10), space_below=m_below)
+                continue
+
+            if stripped.startswith(">"):
+                flush_paragraph()
+                q_body = stripped.lstrip(">").strip()
+                q_markup = f"<i>{inline(q_body)}</i>"
+                layout = PangoCairo.create_layout(cr)
+                layout.set_font_description(Pango.FontDescription.from_string("Sans Italic 10.5"))
+                layout.set_width(int(max(10.0, avail_w - 20.0) * Pango.SCALE))
+                layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+                try:
+                    layout.set_markup(q_markup, -1)
+                except Exception:
+                    layout.set_text(q_body, -1)
+                _, logical = layout.get_pixel_extents()
+                block_h = logical.height + 4.0
+                if y_cursor > pad_top and (y_cursor + block_h > max_y):
+                    new_page()
+                start_y = y_cursor
+                cr.save()
+                cr.set_source_rgb(0.21, 0.52, 0.89)
+                cr.set_line_width(3.0)
+                cr.move_to(pad_x + 2.0, start_y)
+                cr.line_to(pad_x + 2.0, start_y + block_h)
+                cr.stroke()
+                cr.set_source_rgb(0.25, 0.28, 0.32)
+                cr.move_to(pad_x + 14.0, start_y + 2.0)
+                PangoCairo.show_layout(cr, layout)
+                cr.restore()
+                y_cursor += block_h + 8.0
+                continue
+
+            ul_match = re.match(r'^(\s*)([-*+])\s+(.*)$', raw_line)
+            if ul_match:
+                flush_paragraph()
+                indent = min(4, len(ul_match.group(1)) // 2)
+                item_text = ul_match.group(3)
+                bullet = "•"
+                if item_text.startswith("[ ] "):
+                    bullet = "☐"
+                    item_text = item_text[4:]
+                elif item_text.lower().startswith("[x] "):
+                    bullet = "☑"
+                    item_text = item_text[4:]
+                markup = f"<b>{bullet}</b>  {inline(item_text)}"
+                render_pango_block(markup, f"{bullet} {item_text}", "Sans 11", x_off=indent * 18.0, space_below=5.0)
+                continue
+
+            ol_match = re.match(r'^(\s*)(\d+\.)\s+(.*)$', raw_line)
+            if ol_match:
+                flush_paragraph()
+                indent = min(4, len(ol_match.group(1)) // 2)
+                num = ol_match.group(2)
+                item_text = ol_match.group(3)
+                markup = f"<b>{html.escape(num)}</b>  {inline(item_text)}"
+                render_pango_block(markup, f"{num} {item_text}", "Sans 11", x_off=indent * 18.0, space_below=5.0)
+                continue
+
+            paragraph_lines.append(stripped)
+
+        flush_paragraph()
+
+        if y_cursor <= pad_top + 1.0:
+            render_pango_block("<i>Empty Note</i>", "Empty Note", "Sans Italic 11", color=(0.55, 0.55, 0.58))
+
+        cr.show_page()
+        surface.finish()
+        del inline
+

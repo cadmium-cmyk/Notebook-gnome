@@ -1,4 +1,5 @@
 import os
+import math
 import io
 import re
 import json
@@ -9,10 +10,13 @@ import tempfile
 import datetime
 import subprocess
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
 import cairo
 import gi
 
 gi.require_version('Gtk', '4.0')
+gi.require_version('Gdk', '4.0')
+gi.require_version('GdkPixbuf', '2.0')
 from gi.repository import Gio, GLib, Gdk, GdkPixbuf
 
 try:
@@ -23,7 +27,7 @@ except (ValueError, ImportError):
     Poppler = None
     HAS_POPPLER = False
 
-SUPPORTED_EXTENSIONS = ('.xnote', '.xcanvas', '.xtemplate', '.md', '.markdown')
+SUPPORTED_EXTENSIONS = ('.xnote', '.xcanvas', '.xtemplate', '.md', '.markdown', '.rnote')
 
 DEFAULT_RULED_TEMPLATE_ID = "6f16f292a66422f3"
 DEFAULT_RULED_TEMPLATE = {
@@ -96,6 +100,78 @@ class XTemplateEvaluator:
     """Evaluates xtemplate v1 length expressions, parameters, and scene graph items."""
 
     @staticmethod
+    def eval_expr(expr, box_w=210.0, box_h=297.0, ref_dim=210.0, params=None, i=0, j=0, extra_vars=None):
+        if expr is None:
+            return 0.0
+        if isinstance(expr, (int, float)):
+            return float(expr)
+        if not isinstance(expr, str):
+            return 0.0
+        s = expr.strip()
+        if not s:
+            return 0.0
+
+        def repl_unit(m):
+            val = float(m.group(1))
+            unit = m.group(2).lower()
+            if unit == "mm":
+                return f"({val} * 1.0)"
+            elif unit == "cm":
+                return f"({val} * 10.0)"
+            elif unit == "in":
+                return f"({val} * 25.4)"
+            elif unit == "pt":
+                return f"({val} * {25.4 / 72.0})"
+            elif unit == "deg":
+                return f"({val} * 1.0)"
+            elif unit == "%":
+                return f"({val} * {ref_dim / 100.0})"
+            return str(val)
+
+        s_clean = re.sub(r"(?<![a-zA-Z_])(\d+(?:\.\d+)?|\.\d+)\s*(mm|cm|in|pt|deg|%)", repl_unit, s, flags=re.IGNORECASE)
+
+        env = {
+            "W": float(box_w),
+            "H": float(box_h),
+            "i": float(i),
+            "j": float(j),
+            "pi": math.pi,
+            "min": min,
+            "max": max,
+            "abs": abs,
+            "floor": math.floor,
+            "ceil": math.ceil,
+            "round": lambda x: math.floor(x + 0.5) if x >= 0 else math.ceil(x - 0.5),
+            "mod": lambda a, b: a % b,
+            "sqrt": lambda x: math.sqrt(max(0.0, x)),
+            "pow": math.pow,
+            "sin": lambda deg: math.sin(math.radians(deg)),
+            "cos": lambda deg: math.cos(math.radians(deg)),
+            "tan": lambda deg: math.tan(math.radians(deg)),
+            "log10": lambda x: math.log10(x) if x > 0 else 0.0,
+        }
+        if params:
+            for k, v in params.items():
+                if isinstance(v, dict):
+                    raw = v.get("value", v.get("default", 0.0))
+                else:
+                    raw = v
+                if isinstance(raw, (int, float)):
+                    env[k] = float(raw)
+                elif isinstance(raw, str):
+                    try:
+                        env[k] = XTemplateEvaluator.eval_expr(raw, box_w, box_h, ref_dim, params=None)
+                    except Exception:
+                        env[k] = 0.0
+        if extra_vars:
+            env.update(extra_vars)
+
+        try:
+            return float(eval(s_clean, {"__builtins__": {}}, env))
+        except Exception:
+            return 0.0
+
+    @staticmethod
     def eval_length(expr, dpi=150.0, total=0.0, params=None):
         if expr is None:
             return 0.0
@@ -103,52 +179,106 @@ class XTemplateEvaluator:
             return float(expr)
         if not isinstance(expr, str):
             return 0.0
-
         s = expr.strip()
         if not s:
             return 0.0
+        ref_mm = total / (dpi / 25.4) if dpi > 0 else total
+        val_mm = XTemplateEvaluator.eval_expr(s, box_w=ref_mm, box_h=ref_mm, ref_dim=ref_mm, params=params)
+        return val_mm * (dpi / 25.4)
 
-        for i in range(len(s) - 1, 0, -1):
-            ch = s[i]
-            if ch in ('+', '-'):
-                left = s[:i].strip()
-                right = s[i + 1:].strip()
-                if left and right:
-                    lval = XTemplateEvaluator.eval_length(left, dpi, total, params)
-                    rval = XTemplateEvaluator.eval_length(right, dpi, total, params)
-                    return lval + rval if ch == '+' else lval - rval
 
-        if params and s in params:
-            p_val = params[s]
-            if isinstance(p_val, dict):
-                p_val = p_val.get("value", p_val.get("default", 0.0))
-            return XTemplateEvaluator.eval_length(p_val, dpi, total, params)
+class LazyAssetDict(dict):
+    """
+    Dictionary of asset surfaces that supports on-demand lazy decoding.
+    Pre-cached or already decoded surfaces are returned immediately in O(1).
+    Deferred archive assets are decoded when first accessed and retained in-memory.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._lazy = {}
 
-        if s.endswith('%'):
-            try:
-                return (float(s[:-1].strip()) / 100.0) * total
-            except ValueError:
-                return 0.0
+    def register_lazy(self, key, raw_data, aliases=None, cache_key=None):
+        entry = (raw_data, cache_key, set(aliases or []))
+        self._lazy[key] = entry
+        if aliases:
+            for a in aliases:
+                self._lazy[a] = entry
 
-        m = re.match(r'^([+-]?\d+(?:\.\d+)?)\s*(mm|cm|in|pt|px)?$', s, re.IGNORECASE)
-        if m:
-            val = float(m.group(1))
-            unit = (m.group(2) or 'px').lower()
-            if unit == 'mm':
-                return val * (dpi / 25.4)
-            elif unit == 'cm':
-                return val * (dpi / 2.54)
-            elif unit == 'in':
-                return val * dpi
-            elif unit == 'pt':
-                return val * (dpi / 72.0)
-            return val
+    def __getitem__(self, key):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        if hasattr(self, "_lazy") and key in self._lazy:
+            raw_data, cache_key, aliases = self._lazy[key]
+            surf = XNotePackageParser.bytes_to_surface(raw_data)
+            dict.__setitem__(self, key, surf)
+            for a in aliases:
+                dict.__setitem__(self, a, surf)
+                self._lazy.pop(a, None)
+            self._lazy.pop(key, None)
+            if cache_key and surf is not None:
+                XNotePackageParser._archive_asset_cache[cache_key] = surf
+                if len(XNotePackageParser._archive_asset_cache) > XNotePackageParser.MAX_ARCHIVE_ENTRIES:
+                    XNotePackageParser._archive_asset_cache.popitem(last=False)
+            return surf
+        raise KeyError(key)
 
-        return 0.0
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key):
+        return dict.__contains__(self, key) or (hasattr(self, "_lazy") and key in self._lazy)
+
+    def keys(self):
+        s = set(dict.keys(self))
+        if hasattr(self, "_lazy"):
+            s.update(self._lazy.keys())
+        return s
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def __len__(self):
+        return len(self.keys())
+
+    def copy(self):
+        cp = LazyAssetDict(self)
+        if hasattr(self, "_lazy"):
+            cp._lazy = dict(self._lazy)
+        return cp
+
+    def clear(self):
+        super().clear()
+        if hasattr(self, "_lazy"):
+            self._lazy.clear()
 
 
 class XNotePackageParser:
     """Unified loader, PDF importer/exporter, and writer for legacy and v1 .xnote archives."""
+
+    _image_surface_cache = OrderedDict()
+    _archive_asset_cache = OrderedDict()
+    MAX_IMAGE_SURFACES = 150
+    MAX_ARCHIVE_ENTRIES = 200
+    _disk_cache_dir = None
+
+    @classmethod
+    def get_disk_cache_dir(cls):
+        if cls._disk_cache_dir is None:
+            cache_base = GLib.get_user_cache_dir()
+            cls._disk_cache_dir = os.path.join(cache_base, "xnotes_viewer", "image_cache")
+            try:
+                os.makedirs(cls._disk_cache_dir, exist_ok=True)
+            except Exception:
+                pass
+        return cls._disk_cache_dir
+
+    @classmethod
+    def clear_image_caches(cls):
+        cls._image_surface_cache.clear()
+        cls._archive_asset_cache.clear()
 
     @staticmethod
     def pixbuf_to_cairo_surface(pixbuf):
@@ -165,17 +295,27 @@ class XNotePackageParser:
     def bytes_to_surface(cls, data):
         if not data:
             return None
+
+        # 1. In-memory LRU cache check by SHA-256 digest
+        digest = hashlib.sha256(data).digest()
+        cached = cls._image_surface_cache.get(digest)
+        if cached is not None:
+            cls._image_surface_cache.move_to_end(digest)
+            return cached
+
+        # 2. Decode via GdkPixbuf in memory
+        surface = None
         try:
             bytes_data = GLib.Bytes.new(data)
             stream = Gio.MemoryInputStream.new_from_bytes(bytes_data)
             pixbuf = GdkPixbuf.Pixbuf.new_from_stream(stream, None)
             if pixbuf:
-                return cls.pixbuf_to_cairo_surface(pixbuf)
+                surface = cls.pixbuf_to_cairo_surface(pixbuf)
         except Exception:
             pass
 
-        # Fallback for WebP images (e.g. strawberry-thief.webp) if webp-pixbuf-loader is missing
-        if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        # 3. Fallback for WebP images (e.g. strawberry-thief.webp) if webp-pixbuf-loader is missing
+        if surface is None and data[:4] == b'RIFF' and data[8:12] == b'WEBP':
             with tempfile.TemporaryDirectory() as tmpdir:
                 in_webp = os.path.join(tmpdir, "in.webp")
                 out_png = os.path.join(tmpdir, "out.png")
@@ -192,12 +332,19 @@ class XNotePackageParser:
                     cmds.append(["convert", in_webp, out_png])
                 for cmd in cmds:
                     try:
-                        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
                         if os.path.isfile(out_png):
-                            return cairo.ImageSurface.create_from_png(out_png)
+                            surface = cairo.ImageSurface.create_from_png(out_png)
+                            break
                     except Exception:
                         continue
-        return None
+
+        if surface is not None:
+            cls._image_surface_cache[digest] = surface
+            if len(cls._image_surface_cache) > cls.MAX_IMAGE_SURFACES:
+                cls._image_surface_cache.popitem(last=False)
+
+        return surface
 
     @staticmethod
     def extract_template_id(archive_path):
@@ -220,7 +367,7 @@ class XNotePackageParser:
             return None
 
     @classmethod
-    def _render_pdf_with_pdftoppm(cls, pdf_bytes, dpi=150):
+    def _render_pdf_with_pdftoppm(cls, pdf_bytes, dpi=150, first_page_only=False):
         surfaces = []
         if not shutil.which("pdftoppm"):
             return surfaces
@@ -229,9 +376,13 @@ class XNotePackageParser:
             with open(pdf_path, "wb") as f:
                 f.write(pdf_bytes)
             out_prefix = os.path.join(tmpdir, "page")
+            cmd = ["pdftoppm", "-png", "-r", str(int(dpi))]
+            if first_page_only:
+                cmd.extend(["-f", "1", "-l", "1"])
+            cmd.extend([pdf_path, out_prefix])
             try:
                 subprocess.run(
-                    ["pdftoppm", "-png", "-r", str(int(dpi)), pdf_path, out_prefix],
+                    cmd,
                     check=True,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL
@@ -270,6 +421,35 @@ class XNotePackageParser:
                 templates[tid] = t_entry
                 if meta.get("id"):
                     templates[meta["id"]] = t_entry
+
+    _system_templates_cache = None
+    _system_assets_cache = None
+
+    @classmethod
+    def load_system_templates(cls, templates, assets=None):
+        if cls._system_templates_cache is None:
+            cache_t = {}
+            cache_a = {}
+            cls._register_builtin_templates(cache_t)
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            tpl_dir = os.path.join(base_dir, "templates")
+            if os.path.isdir(tpl_dir):
+                for root, _, files in os.walk(tpl_dir):
+                    for f in sorted(files):
+                        if f.endswith(".xtemplate"):
+                            full_p = os.path.join(root, f)
+                            try:
+                                with open(full_p, "rb") as fp:
+                                    data = fp.read()
+                                cls._load_xtemplate_bytes(f, data, cache_a, cache_t)
+                            except Exception:
+                                pass
+            cls._system_templates_cache = cache_t
+            cls._system_assets_cache = cache_a
+
+        templates.update(cls._system_templates_cache)
+        if assets is not None:
+            assets.update(cls._system_assets_cache)
 
     @classmethod
     def _load_xtemplate_bytes(cls, name, data, assets, templates):
@@ -542,7 +722,7 @@ class XNotePackageParser:
         return cls.load_archive(dest_xnote_path)
 
     @classmethod
-    def export_to_pdf(cls, pdf_path, doc, canvas):
+    def export_to_pdf(cls, pdf_path, doc, canvas, with_background=True, with_pattern=True, optimize_for_printing=False):
         pages = doc.get("pages", [])
         if not pages:
             raise ValueError("Document has no pages to export.")
@@ -563,7 +743,8 @@ class XNotePackageParser:
             cr.rectangle(0.0, 0.0, pw, ph)
             cr.clip()
             canvas.render_page_contents(
-                cr, doc, page, pw, ph, canvas.assets, canvas.templates, page_idx=idx
+                cr, doc, page, pw, ph, canvas.assets, canvas.templates, page_idx=idx,
+                with_background=with_background, with_pattern=with_pattern, optimize_for_printing=optimize_for_printing
             )
             cr.restore()
             pdf_surface.show_page()
@@ -628,16 +809,52 @@ class XNotePackageParser:
 
     @classmethod
     def load_archive(cls, path, thumbnails_only=False):
-        if not zipfile.is_zipfile(path):
-            raise ValueError("Not a valid ZIP-based notebook archive.")
-
         doc = {}
-        assets = {}
+        assets = LazyAssetDict()
         templates = {}
         raw_assets = {}
         flow_info = None
         pdf_bytes = None
         pdf_archive_name = None
+
+        try:
+            mtime = os.path.getmtime(path) if os.path.exists(path) else 0.0
+        except OSError:
+            mtime = 0.0
+
+        if path.lower().endswith('.rnote'):
+            from rnote.convert_rnote import convert_rnote_to_doc_and_assets
+            return convert_rnote_to_doc_and_assets(path)
+
+        if not zipfile.is_zipfile(path):
+            try:
+                with open(path, 'rb') as raw_f:
+                    raw_data = raw_f.read()
+                data_stripped = raw_data.lstrip()
+                if data_stripped.startswith(b'{'):
+                    t_entry = cls._load_xtemplate_bytes(os.path.basename(path), raw_data, assets, templates)
+                    if t_entry:
+                        cls._register_builtin_templates(templates)
+                        cls.load_system_templates(templates, assets)
+                        tid = t_entry.get("id") or cls.extract_template_id(path)
+                        t_meta = t_entry.get("meta", {})
+                        doc = {
+                            "format": "xtemplate",
+                            "version": 1,
+                            "dpi": 150,
+                            "pages": [{
+                                "width": 1240.1574803149608,
+                                "height": 1753.9370078740158,
+                                "cover": t_meta.get("kind") == "cover",
+                                "style": {"template": tid},
+                                "items": []
+                            }],
+                            "style": {"page_color": [255, 255, 255, 255], "template": tid}
+                        }
+                        return doc, assets, templates
+            except Exception:
+                pass
+            raise ValueError("Not a valid ZIP-based notebook archive.")
 
         with zipfile.ZipFile(path, 'r') as z:
             namelist = z.namelist()
@@ -645,11 +862,33 @@ class XNotePackageParser:
             if 'manifest.json' in namelist:
                 with z.open('manifest.json') as f:
                     doc = json.load(f)
+                if doc.get("format") == "xcanvas":
+                    canvas_items = doc.setdefault("items", [])
+                    bg = doc.setdefault("background", {
+                        "pattern": "none",
+                        "pattern_color": [150, 150, 150, 64],
+                        "spacing": 64,
+                        "paper_color": [255, 255, 255, 255]
+                    })
+                    doc.setdefault("view", {
+                        "cx": 0.0,
+                        "cy": 0.0,
+                        "zoom": 1.0
+                    })
+                    doc["pages"] = [{
+                        "width": 0,
+                        "height": 0,
+                        "style": bg,
+                        "items": canvas_items,
+                        "is_canvas": True
+                    }]
             elif 'template.json' in namelist:
                 with z.open('template.json') as f:
                     t_meta = json.load(f)
                 with open(path, 'rb') as raw_f:
                     cls._load_xtemplate_bytes(os.path.basename(path), raw_f.read(), assets, templates)
+                cls._register_builtin_templates(templates)
+                cls.load_system_templates(templates, assets)
                 tid = cls.extract_template_id(path)
                 doc = {
                     "format": "xtemplate",
@@ -666,59 +905,52 @@ class XNotePackageParser:
                 }
                 return doc, assets, templates
 
-            needed_assets = set()
-            needed_templates = set()
-
-            if thumbnails_only:
-                doc_style = doc.get("style", {}) if isinstance(doc.get("style"), dict) else {}
-                t_doc = doc_style.get("template") or doc_style.get("pattern")
-                if t_doc:
-                    needed_templates.add(t_doc)
-                    needed_templates.add(cls.extract_template_id(t_doc))
-                    needed_templates.add(os.path.basename(t_doc))
-
-                pages = doc.get("pages", [])
-                if pages:
-                    p0 = pages[0]
-                    p0_style = p0.get("style", {}) if isinstance(p0.get("style"), dict) else {}
-                    t_p0 = p0_style.get("template") or p0_style.get("pattern") or p0.get("template")
-                    if t_p0:
-                        needed_templates.add(t_p0)
-                        needed_templates.add(cls.extract_template_id(t_p0))
-                        needed_templates.add(os.path.basename(t_p0))
-                    for item in p0.get("items", []):
-                        if isinstance(item, dict):
-                            a = item.get("asset") or item.get("src") or item.get("image")
-                            if a:
-                                needed_assets.add(a)
-                                needed_assets.add(os.path.basename(a))
-
             if 'flow.xml' in namelist:
                 try:
                     flow_info = cls._parse_flow_xml(z.read('flow.xml'))
                 except Exception as e:
                     print(f"Warning: Failed to read flow.xml in {path}: {e}")
 
+            # In thumbnail generation mode, optimize loading by only fetching page 0 requirements
+            pages = doc.get("pages") or [{}]
+            page0 = pages[0] if pages else {}
+            page0_needs_pdf = ("pdf_page" in page0 and page0.get("pdf_page") is not None)
+            page0_assets = set()
+            if doc.get("format") == "xcanvas":
+                check_items = doc.get("items") or (page0.get("items", []) if page0 else [])
+            else:
+                check_items = page0.get("items", []) if page0 else []
+            for it in check_items:
+                if isinstance(it, dict):
+                    for k in ("asset", "src", "image"):
+                        v = it.get(k)
+                        if v and isinstance(v, str):
+                            page0_assets.add(v)
+                            page0_assets.add(os.path.basename(v))
+
             for name in namelist:
                 if name.endswith('/') or name in ('manifest.json', 'flow.xml', 'template.json'):
                     continue
 
                 lower_name = name.lower()
-                base_name = os.path.basename(name)
-                tid_name = cls.extract_template_id(name)
 
-                if thumbnails_only:
-                    is_template = lower_name.endswith('.xtemplate') or name.startswith('templates/')
-                    is_pdf = lower_name.endswith('.pdf')
-                    is_asset = name.startswith('assets/')
+                # Fast skip: don't extract large PDF bytes if thumbnail page 0 doesn't use PDF
+                if thumbnails_only and lower_name.endswith('.pdf') and not page0_needs_pdf:
+                    continue
 
-                    if is_template:
-                        if needed_templates and not (name in needed_templates or base_name in needed_templates or tid_name in needed_templates):
-                            continue
-                    elif is_asset:
-                        if needed_assets and not (name in needed_assets or base_name in needed_assets or tid_name in needed_assets):
-                            continue
-                    elif not is_pdf:
+                # Fast skip: don't decode non-cover assets when rendering cover thumbnail
+                if thumbnails_only and name.startswith('assets/') and not lower_name.endswith('.xtemplate'):
+                    if name not in page0_assets and os.path.basename(name) not in page0_assets:
+                        continue
+
+                # Check archive asset cache first: if cached and in thumbnails_only, skip z.read entirely
+                if thumbnails_only and name.startswith('assets/') and not lower_name.endswith('.xtemplate'):
+                    cache_key = (path, name, mtime)
+                    cached_surf = cls._archive_asset_cache.get(cache_key)
+                    if cached_surf is not None:
+                        assets[name] = cached_surf
+                        assets[os.path.basename(name)] = cached_surf
+                        cls._archive_asset_cache.move_to_end(cache_key)
                         continue
 
                 try:
@@ -736,33 +968,77 @@ class XNotePackageParser:
                     if lower_name.endswith('.xtemplate') or zipfile.is_zipfile(io.BytesIO(raw_data)):
                         cls._load_xtemplate_bytes(name, raw_data, assets, templates)
                     else:
-                        try:
-                            surf = cls.bytes_to_surface(raw_data)
-                            if surf:
-                                assets[name] = surf
-                                assets[os.path.basename(name)] = surf
-                                raw_assets[name] = raw_data
-                        except Exception as e:
-                            print(f"Failed to load asset {name}: {e}")
+                        cache_key = (path, name, mtime)
+                        if not thumbnails_only:
+                            raw_assets[name] = raw_data
+                        cached_surf = cls._archive_asset_cache.get(cache_key)
+                        if cached_surf is not None:
+                            assets[name] = cached_surf
+                            assets[os.path.basename(name)] = cached_surf
+                            cls._archive_asset_cache.move_to_end(cache_key)
+                        elif thumbnails_only or name in page0_assets or os.path.basename(name) in page0_assets:
+                            try:
+                                surf = cls.bytes_to_surface(raw_data)
+                                if surf:
+                                    assets[name] = surf
+                                    assets[os.path.basename(name)] = surf
+                                    cls._archive_asset_cache[cache_key] = surf
+                                    if len(cls._archive_asset_cache) > cls.MAX_ARCHIVE_ENTRIES:
+                                        cls._archive_asset_cache.popitem(last=False)
+                            except Exception as e:
+                                print(f"Failed to load asset {name}: {e}")
+                        else:
+                            base = os.path.basename(name)
+                            assets.register_lazy(name, raw_data, aliases=[base] if base != name else None, cache_key=cache_key)
 
-        if not thumbnails_only:
-            cls._register_builtin_templates(templates)
+        if doc.get("format") == "xcanvas":
+            return doc, assets, templates
+
+        # Always register built-in and system templates
+        cls._register_builtin_templates(templates)
+        cls.load_system_templates(templates, assets)
 
         if flow_info:
             doc["_flow"] = flow_info
         if raw_assets:
             doc["_raw_assets"] = raw_assets
         if pdf_bytes:
-            doc["_pdf_bytes"] = pdf_bytes
-            doc["_pdf_archive_name"] = pdf_archive_name or "document.pdf"
+            if not thumbnails_only:
+                doc["_pdf_bytes"] = pdf_bytes
+                doc["_pdf_archive_name"] = pdf_archive_name or "document.pdf"
             poppler_doc = cls._load_poppler_document_from_bytes(pdf_bytes)
             if poppler_doc is not None:
                 doc["_poppler_doc"] = poppler_doc
             else:
                 dpi = float(doc.get("dpi", 150.0))
-                doc["_pdf_surfaces"] = cls._render_pdf_with_pdftoppm(pdf_bytes, dpi=dpi)
+                doc["_pdf_surfaces"] = cls._render_pdf_with_pdftoppm(pdf_bytes, dpi=dpi, first_page_only=thumbnails_only)
 
         return doc, assets, templates
+
+    @classmethod
+    def create_new_canvas(cls, path):
+        now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        doc = {
+            "format": "xcanvas",
+            "version": 1,
+            "writer": 48,
+            "created": now_iso,
+            "dpi": 150,
+            "background": {
+                "pattern": "none",
+                "pattern_color": [150, 150, 150, 64],
+                "spacing": 64,
+                "paper_color": [255, 255, 255, 255]
+            },
+            "view": {
+                "cx": 0.0,
+                "cy": 0.0,
+                "zoom": 1.0
+            },
+            "items": []
+        }
+        cls.save_archive(path, doc)
+        return cls.load_archive(path)
 
     @classmethod
     def create_new_notebook(cls, path):
@@ -796,6 +1072,38 @@ class XNotePackageParser:
 
     @classmethod
     def save_archive(cls, path, doc, templates=None):
+        if doc.get("format") == "xcanvas":
+            now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+            canvas_items = doc.get("items")
+            if canvas_items is None and doc.get("pages"):
+                canvas_items = doc["pages"][0].get("items", [])
+            manifest = {
+                "format": "xcanvas",
+                "version": doc.get("version", 1),
+                "writer": doc.get("writer", 48),
+                "created": doc.get("created", now_iso),
+                "dpi": doc.get("dpi", 150),
+                "background": doc.get("background", {
+                    "pattern": "none",
+                    "pattern_color": [150, 150, 150, 64],
+                    "spacing": 64,
+                    "paper_color": [255, 255, 255, 255]
+                }),
+                "view": doc.get("view", {
+                    "cx": 0.0,
+                    "cy": 0.0,
+                    "zoom": 1.0
+                }),
+                "items": canvas_items if canvas_items is not None else []
+            }
+            tmp_path = f"{path}.tmp"
+            with zipfile.ZipFile(tmp_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+                for asset_path, raw_bytes in doc.get("_raw_assets", {}).items():
+                    if asset_path and raw_bytes:
+                        zout.writestr(asset_path, raw_bytes)
+                zout.writestr('manifest.json', json.dumps(manifest, indent=2).encode('utf-8'))
+            os.replace(tmp_path, path)
+            return
         existing_entries = {}
         if os.path.exists(path) and zipfile.is_zipfile(path):
             with zipfile.ZipFile(path, 'r') as zin:
@@ -855,4 +1163,8 @@ class XNotePackageParser:
         base = os.path.basename(ref)
         if base in templates:
             return templates[base]
+        if ref.endswith('.xtemplate') and ref[:-10] in templates:
+            return templates[ref[:-10]]
+        if f"{ref}.xtemplate" in templates:
+            return templates[f"{ref}.xtemplate"]
         return None

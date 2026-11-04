@@ -5,6 +5,7 @@ gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, Gio, GLib, Gdk
 
 from xnote_io import XNotePackageParser
+from markdown_renderer import MarkdownRenderer
 
 try:
     gi.require_version('Adw', '1')
@@ -16,7 +17,7 @@ except (ValueError, ImportError):
 
 
 class DocumentActionsMixin:
-    """Mixin class for XNotesViewerWindow handling PDF import/export, default launcher, app chooser, and unsaved changes confirmation."""
+    """Mixin class for XNotesViewerWindow handling PDF and Rnote import/export, default launcher, app chooser, and unsaved changes confirmation."""
 
     def on_import_pdf_into_current_clicked(self, *_):
         if not self.canvas.document:
@@ -102,36 +103,77 @@ class DocumentActionsMixin:
         except Exception as e:
             self.show_error(f"Failed to create notebook from PDF: {e}")
 
-    def on_export_pdf_clicked(self, *_):
-        if not self.canvas.document or self.current_file_type not in ("xnote", "xcanvas", "xtemplate"):
-            self.show_error("Open an .xnote notebook to export as PDF.")
-            return
+    def on_import_rnote_as_new_notebook_clicked(self, *_):
         if hasattr(Gtk, "FileDialog"):
-            base_name = (
-                os.path.splitext(os.path.basename(self.current_file_path))[0]
-                if self.current_file_path else "Notebook"
-            )
-            dialog = Gtk.FileDialog(title="Export Notebook to PDF")
-            dialog.set_initial_name(f"{base_name}.pdf")
-            if self.current_file_path:
-                dialog.set_initial_folder(Gio.File.new_for_path(os.path.dirname(self.current_file_path)))
-            dialog.save(self, None, self._on_export_pdf_dest_chosen)
+            dialog = Gtk.FileDialog(title="Select Rnote Document (.rnote)")
+            filters = Gio.ListStore.new(Gtk.FileFilter)
+            rnote_filter = Gtk.FileFilter()
+            rnote_filter.set_name("Rnote Documents (*.rnote)")
+            rnote_filter.add_pattern("*.rnote")
+            filters.append(rnote_filter)
+            dialog.set_filters(filters)
+            dialog.open(self, None, self._on_rnote_chosen_for_new_notebook)
         else:
-            self.show_error("Gtk.FileDialog is required to export PDF files.")
+            self.show_error("Gtk.FileDialog is required to import Rnote files.")
 
-    def _on_export_pdf_dest_chosen(self, dialog, result):
+    def _on_rnote_chosen_for_new_notebook(self, dialog, result):
+        try:
+            gfile = dialog.open_finish(result)
+            if gfile and gfile.get_path():
+                rnote_path = gfile.get_path()
+                base_name = os.path.splitext(os.path.basename(rnote_path))[0]
+                save_dlg = Gtk.FileDialog(title="Save Imported Rnote as .xnote Notebook")
+                save_dlg.set_initial_name(f"{base_name}.xnote")
+                target_folder = self._get_active_category_folder()
+                if target_folder and os.path.isdir(target_folder):
+                    save_dlg.set_initial_folder(Gio.File.new_for_path(target_folder))
+                save_dlg.save(self, None, self._on_new_rnote_dest_chosen, rnote_path)
+        except GLib.Error:
+            pass
+
+    def _on_new_rnote_dest_chosen(self, dialog, result, rnote_path):
         try:
             gfile = dialog.save_finish(result)
             if gfile and gfile.get_path():
-                pdf_path = gfile.get_path()
-                if not pdf_path.lower().endswith(".pdf"):
-                    pdf_path += ".pdf"
-                XNotePackageParser.export_to_pdf(pdf_path, self.canvas.document, self.canvas)
-                self.show_toast(f"Exported PDF to {os.path.basename(pdf_path)}")
+                dest_path = gfile.get_path()
+                if not dest_path.lower().endswith((".xnote", ".xcanvas")):
+                    dest_path += ".xnote"
+                from rnote.convert_rnote import convert_rnote_to_xnote
+                convert_rnote_to_xnote(rnote_path, dest_path)
+                if self.current_root_folder:
+                    self.load_folder(self.current_root_folder)
+                self.load_document(dest_path)
+                self.show_toast(f"Imported {os.path.basename(dest_path)} from Rnote")
         except GLib.Error:
             pass
         except Exception as e:
-            self.show_error(f"Failed to export PDF: {e}")
+            self.show_error(f"Failed to import Rnote file: {e}")
+
+    def on_export_document_clicked(self, *_):
+        is_markdown = (self.current_file_type in ("md", "markdown"))
+        is_xnote = bool(self.canvas.document and self.current_file_type in ("xnote", "xcanvas", "xtemplate"))
+        if not is_markdown and not is_xnote:
+            self.show_error("Open a notebook, canvas, or Markdown note to export.")
+            return
+
+        from export_dialog import ExportDocumentDialog
+        dialog = ExportDocumentDialog(
+            self,
+            self.canvas.document,
+            self.canvas,
+            current_file_path=self.current_file_path,
+            current_file_type=self.current_file_type
+        )
+        if hasattr(dialog, "present"):
+            dialog.present(self)
+        else:
+            dialog.show()
+
+    def on_export_pdf_clicked(self, *_):
+        self.on_export_document_clicked(*_)
+
+    def on_export_rnote_clicked(self, *_):
+        self.on_export_document_clicked(*_)
 
     def _confirm_unsaved_changes(self, on_proceed_callback):
         if not self.is_modified or self.root_stack.get_visible_child_name() != "viewer":
