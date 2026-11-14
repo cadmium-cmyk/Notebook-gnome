@@ -3,6 +3,7 @@ import math
 import io
 import re
 import json
+import html
 import shutil
 import hashlib
 import zipfile
@@ -258,11 +259,104 @@ class LazyAssetDict(dict):
 class XNotePackageParser:
     """Unified loader, PDF importer/exporter, and writer for legacy and v1 .xnote archives."""
 
+    WRITER_NOTE = 67
+    WRITER_CANVAS = 47
+
     _image_surface_cache = OrderedDict()
     _archive_asset_cache = OrderedDict()
     MAX_IMAGE_SURFACES = 150
     MAX_ARCHIVE_ENTRIES = 200
     _disk_cache_dir = None
+
+    @classmethod
+    def _clean_item_for_manifest(cls, item):
+        if not isinstance(item, dict):
+            return item
+        clean = {}
+        for k, v in item.items():
+            if k.startswith('_'):
+                continue
+            if k == "samples" and isinstance(v, list):
+                clean_samples = []
+                for s in v:
+                    if isinstance(s, dict):
+                        clean_samples.append([round(float(s.get("x", 0)), 2), round(float(s.get("y", 0)), 2), round(float(s.get("pressure", 0.5)), 3)])
+                    elif isinstance(s, (list, tuple)):
+                        pt = [round(float(s[0]), 2), round(float(s[1]), 2)]
+                        if len(s) > 2:
+                            pt.append(round(float(s[2]), 3))
+                        if len(s) > 3:
+                            pt.append(int(s[3]))
+                        clean_samples.append(pt)
+                    else:
+                        clean_samples.append(s)
+                clean[k] = clean_samples
+            elif k in ("rect", "start", "end", "pos") and isinstance(v, list):
+                clean[k] = [round(float(x), 2) if isinstance(x, (int, float)) else x for x in v]
+            elif k == "points" and isinstance(v, list):
+                clean[k] = [
+                    [round(float(c), 2) for c in pt] if isinstance(pt, (list, tuple)) else pt
+                    for pt in v
+                ]
+            elif isinstance(v, dict):
+                clean[k] = cls._clean_item_for_manifest(v)
+            else:
+                clean[k] = v
+        return clean
+
+    @classmethod
+    def _parse_markups_xfdf(cls, xml_bytes):
+        markups_by_page = {}
+        try:
+            root = ET.fromstring(xml_bytes)
+            for annot in root.iter():
+                tag = annot.tag.split("}")[-1].lower()
+                if tag in ("highlight", "underline", "strikeout"):
+                    p_idx = int(annot.attrib.get("page", 0))
+                    color_hex = annot.attrib.get("color", "#FFFF00")
+                    quads_val = (
+                        annot.attrib.get("{urn:xnotes:markups:1.0}quads")
+                        or annot.attrib.get("xnotes:quads")
+                        or annot.attrib.get("coords", "")
+                    )
+                    text = "".join(annot.itertext()).strip()
+                    m_entry = {
+                        "type": tag,
+                        "color": color_hex,
+                        "quads": quads_val,
+                        "text": text,
+                    }
+                    markups_by_page.setdefault(p_idx, []).append(m_entry)
+        except Exception as e:
+            print(f"Failed to parse markups.xfdf: {e}")
+        return markups_by_page
+
+    @classmethod
+    def _write_markups_xfdf(cls, pages):
+        has_markups = any(bool(p.get("markups")) for p in pages if isinstance(p, dict))
+        if not has_markups:
+            return None
+        lines = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            '<xfdf xmlns="http://ns.adobe.com/xfdf/" xmlns:xnotes="urn:xnotes:markups:1.0" xml:space="preserve">',
+            ' <annots>'
+        ]
+        now_str = datetime.datetime.now(datetime.timezone.utc).strftime("D:%Y%m%d%H%M%SZ")
+        for i, page in enumerate(pages):
+            for m in page.get("markups", []):
+                m_type = m.get("type", "highlight")
+                col = m.get("color", "#FFFF00")
+                quads = m.get("quads", "")
+                text = html.escape(m.get("text", "")) if "html" in globals() else m.get("text", "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                lines.append(
+                    f'  <{m_type} page="{i}" color="{col}" creationdate="{now_str}" xnotes:quads="{quads}">'
+                )
+                if text:
+                    lines.append(f'   <contents>{text}</contents>')
+                lines.append(f'  </{m_type}>')
+        lines.append(' </annots>')
+        lines.append('</xfdf>')
+        return "\n".join(lines).encode("utf-8")
 
     @classmethod
     def get_disk_cache_dir(cls):
@@ -816,6 +910,7 @@ class XNotePackageParser:
         flow_info = None
         pdf_bytes = None
         pdf_archive_name = None
+        markups_xfdf_bytes = None
 
         try:
             mtime = os.path.getmtime(path) if os.path.exists(path) else 0.0
@@ -959,9 +1054,11 @@ class XNotePackageParser:
                     print(f"Failed to read {name} from archive: {e}")
                     continue
 
-                if lower_name.endswith('.pdf'):
+                if lower_name.endswith('.pdf') or name == 'assets/source.pdf':
                     pdf_bytes = raw_data
                     pdf_archive_name = name
+                elif name == 'markups.xfdf':
+                    markups_xfdf_bytes = raw_data
                 elif lower_name.endswith('.xtemplate') or name.startswith('templates/'):
                     cls._load_xtemplate_bytes(name, raw_data, assets, templates)
                 elif name.startswith('assets/'):
@@ -991,6 +1088,12 @@ class XNotePackageParser:
                             base = os.path.basename(name)
                             assets.register_lazy(name, raw_data, aliases=[base] if base != name else None, cache_key=cache_key)
 
+        if markups_xfdf_bytes and "pages" in doc:
+            markups_by_page = cls._parse_markups_xfdf(markups_xfdf_bytes)
+            for p_idx, marks in markups_by_page.items():
+                if 0 <= p_idx < len(doc["pages"]):
+                    doc["pages"][p_idx]["markups"] = marks
+
         if doc.get("format") == "xcanvas":
             return doc, assets, templates
 
@@ -1005,7 +1108,7 @@ class XNotePackageParser:
         if pdf_bytes:
             if not thumbnails_only:
                 doc["_pdf_bytes"] = pdf_bytes
-                doc["_pdf_archive_name"] = pdf_archive_name or "document.pdf"
+                doc["_pdf_archive_name"] = pdf_archive_name or "assets/source.pdf"
             poppler_doc = cls._load_poppler_document_from_bytes(pdf_bytes)
             if poppler_doc is not None:
                 doc["_poppler_doc"] = poppler_doc
@@ -1021,7 +1124,7 @@ class XNotePackageParser:
         doc = {
             "format": "xcanvas",
             "version": 1,
-            "writer": 48,
+            "writer": cls.WRITER_CANVAS,
             "created": now_iso,
             "dpi": 150,
             "background": {
@@ -1046,7 +1149,7 @@ class XNotePackageParser:
         doc = {
             "format": "xnote",
             "version": 1,
-            "writer": 48,
+            "writer": cls.WRITER_NOTE,
             "created": now_iso,
             "dpi": 150,
             "has_pdf": False,
@@ -1077,10 +1180,11 @@ class XNotePackageParser:
             canvas_items = doc.get("items")
             if canvas_items is None and doc.get("pages"):
                 canvas_items = doc["pages"][0].get("items", [])
+            clean_items = [cls._clean_item_for_manifest(it) for it in (canvas_items or [])]
             manifest = {
                 "format": "xcanvas",
                 "version": doc.get("version", 1),
-                "writer": doc.get("writer", 48),
+                "writer": cls.WRITER_CANVAS,
                 "created": doc.get("created", now_iso),
                 "dpi": doc.get("dpi", 150),
                 "background": doc.get("background", {
@@ -1094,14 +1198,20 @@ class XNotePackageParser:
                     "cy": 0.0,
                     "zoom": 1.0
                 }),
-                "items": canvas_items if canvas_items is not None else []
+                "items": clean_items
             }
+            if doc.get("waypoints"):
+                manifest["waypoints"] = doc["waypoints"]
             tmp_path = f"{path}.tmp"
-            with zipfile.ZipFile(tmp_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+            with zipfile.ZipFile(tmp_path, 'w') as zout:
                 for asset_path, raw_bytes in doc.get("_raw_assets", {}).items():
                     if asset_path and raw_bytes:
-                        zout.writestr(asset_path, raw_bytes)
-                zout.writestr('manifest.json', json.dumps(manifest, indent=2).encode('utf-8'))
+                        zinfo = zipfile.ZipInfo(asset_path)
+                        zinfo.compress_type = zipfile.ZIP_STORED
+                        zout.writestr(zinfo, raw_bytes)
+                zinfo = zipfile.ZipInfo("manifest.json")
+                zinfo.compress_type = zipfile.ZIP_DEFLATED
+                zout.writestr(zinfo, json.dumps(manifest, separators=(',', ':')).encode('utf-8'))
             os.replace(tmp_path, path)
             return
         existing_entries = {}
@@ -1125,27 +1235,77 @@ class XNotePackageParser:
                     existing_entries[t_path] = raw_bytes
                     seen_paths.add(t_path)
 
-        for asset_path, raw_bytes in doc.get("_raw_assets", {}).items():
-            if asset_path and raw_bytes:
-                existing_entries[asset_path] = raw_bytes
+        if doc.get("_pdf_bytes"):
+            doc["_pdf_archive_name"] = "assets/source.pdf"
+
+        # Separate stored binary assets (images, audio, PDF) from deflated tail entries (flow, templates, manifest)
+        # Spec 08 invariant: Stored assets first (ZIP_STORED), tail entries last (ZIP_DEFLATED)
+        stored_entries = {}
+        tail_entries = {}
 
         if doc.get("_pdf_bytes"):
-            pdf_name = doc.get("_pdf_archive_name", "document.pdf")
-            existing_entries[pdf_name] = doc["_pdf_bytes"]
+            stored_entries["assets/source.pdf"] = doc["_pdf_bytes"]
+
+        for asset_path, raw_bytes in doc.get("_raw_assets", {}).items():
+            if asset_path and raw_bytes:
+                stored_entries[asset_path] = raw_bytes
+
+        # Existing entries carried over
+        for filename, content in existing_entries.items():
+            if filename.startswith("assets/"):
+                stored_entries[filename] = content
+            elif filename in ("flow.xml", "markups.xfdf") or filename.startswith("templates/"):
+                tail_entries[filename] = content
+
+        if "flow.xml" not in tail_entries:
+            tail_entries["flow.xml"] = DEFAULT_FLOW_XML.encode("utf-8")
+
+        if templates:
+            for t_info in templates.values():
+                if not isinstance(t_info, dict):
+                    continue
+                t_path = t_info.get("path")
+                raw_bytes = t_info.get("raw_bytes")
+                if t_path and raw_bytes:
+                    if t_path.startswith("assets/"):
+                        stored_entries[t_path] = raw_bytes
+                    else:
+                        tail_entries[t_path] = raw_bytes
+
+        # Export markups if present
+        markups_xml = cls._write_markups_xfdf(doc.get("pages", []))
+        if markups_xml:
+            tail_entries["markups.xfdf"] = markups_xml
 
         clean_doc = {k: v for k, v in doc.items() if not k.startswith('_')}
+        clean_doc["writer"] = cls.WRITER_NOTE
         clean_pages = []
         for p in doc.get("pages", []):
             clean_p = {k: v for k, v in p.items() if not k.startswith('_')}
+            if "items" in clean_p and isinstance(clean_p["items"], list):
+                clean_p["items"] = [cls._clean_item_for_manifest(it) for it in clean_p["items"]]
             clean_pages.append(clean_p)
         clean_doc["pages"] = clean_pages
 
         tmp_path = f"{path}.tmp"
-        with zipfile.ZipFile(tmp_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
-            for filename, content in existing_entries.items():
-                zout.writestr(filename, content)
+        with zipfile.ZipFile(tmp_path, 'w') as zout:
+            # 1. STORED assets first
+            for filename, content in stored_entries.items():
+                zinfo = zipfile.ZipInfo(filename)
+                zinfo.compress_type = zipfile.ZIP_STORED
+                zout.writestr(zinfo, content)
+
+            # 2. DEFLATED tail entries next
+            for filename, content in tail_entries.items():
+                zinfo = zipfile.ZipInfo(filename)
+                zinfo.compress_type = zipfile.ZIP_DEFLATED
+                zout.writestr(zinfo, content)
+
+            # 3. Manifest LAST
+            zinfo = zipfile.ZipInfo("manifest.json")
+            zinfo.compress_type = zipfile.ZIP_DEFLATED
             zout.writestr(
-                'manifest.json',
+                zinfo,
                 json.dumps(clean_doc, separators=(',', ':')).encode('utf-8')
             )
 

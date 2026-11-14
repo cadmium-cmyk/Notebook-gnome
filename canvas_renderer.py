@@ -953,6 +953,102 @@ class CanvasRendererMixin:
                             cls._draw_xtemplate_items(cr, children, box_x + off_x + x_shift, box_y + off_y, cell_w, cell_h, page_w, page_h, params, pattern_rgba, accent_rgba, node_style, t_info, assets, col_idx, row_idx, rep_vars)
                     cr.restore()
 
+    def draw_markups(self, cr, markups, dpi=150.0):
+        """Renders ISO 19444-1 / Spec 08 text markups over the PDF layer."""
+        if not markups:
+            return
+        scale = dpi / 72.0
+
+        for m in markups:
+            m_type = m.get("type", "highlight").lower()
+            color_val = m.get("color", "#FFFF00")
+            if isinstance(color_val, (list, tuple)) and len(color_val) >= 3:
+                mr, mg, mb = color_val[0] / 255.0, color_val[1] / 255.0, color_val[2] / 255.0
+            elif isinstance(color_val, str) and color_val.startswith("#"):
+                hx = color_val.lstrip("#")
+                if len(hx) == 6:
+                    mr = int(hx[0:2], 16) / 255.0
+                    mg = int(hx[2:4], 16) / 255.0
+                    mb = int(hx[4:6], 16) / 255.0
+                elif len(hx) == 8:
+                    mr = int(hx[0:2], 16) / 255.0
+                    mg = int(hx[2:4], 16) / 255.0
+                    mb = int(hx[4:6], 16) / 255.0
+                else:
+                    mr, mg, mb = 1.0, 1.0, 0.0
+            else:
+                mr, mg, mb = 1.0, 1.0, 0.0
+
+            intensity = float(m.get("intensity", m.get("opacity", 0.5)))
+            quads_raw = m.get("quads", "")
+            rects = []
+
+            if isinstance(quads_raw, list):
+                for q in quads_raw:
+                    if isinstance(q, dict):
+                        rects.append([float(q.get("left", 0)), float(q.get("top", 0)), float(q.get("right", 0)), float(q.get("bottom", 0))])
+                    elif isinstance(q, (list, tuple)) and len(q) >= 4:
+                        rects.append([float(q[0]), float(q[1]), float(q[2]), float(q[3])])
+            elif isinstance(quads_raw, str) and quads_raw.strip():
+                vals = [float(v) for v in re.findall(r'[-+]?\d*\.?\d+', quads_raw)]
+                if len(vals) % 5 == 0:
+                    for i in range(0, len(vals), 5):
+                        rects.append([vals[i], vals[i+1], vals[i+2], vals[i+3]])
+                elif len(vals) % 8 == 0:
+                    for i in range(0, len(vals), 8):
+                        xs = [vals[i], vals[i+2], vals[i+4], vals[i+6]]
+                        ys = [vals[i+1], vals[i+3], vals[i+5], vals[i+7]]
+                        rects.append([min(xs), min(ys), max(xs), max(ys)])
+                elif len(vals) % 4 == 0:
+                    for i in range(0, len(vals), 4):
+                        rects.append([vals[i], vals[i+1], vals[i+2], vals[i+3]])
+
+            if not rects:
+                continue
+
+            cr.save()
+            if m_type == "highlight":
+                cr.set_source_rgba(mr, mg, mb, intensity)
+                for l, t, r, b in rects:
+                    cr.rectangle(l * scale, t * scale, max(2.0, (r - l) * scale), max(2.0, (b - t) * scale))
+                cr.fill()
+            elif m_type == "underline":
+                cr.set_source_rgba(mr, mg, mb, 0.95)
+                cr.set_line_width(max(1.5, 1.4 * scale))
+                for l, t, r, b in rects:
+                    y_pos = (b - 1.0) * scale
+                    cr.move_to(l * scale, y_pos)
+                    cr.line_to(r * scale, y_pos)
+                cr.stroke()
+            elif m_type == "strikeout":
+                cr.set_source_rgba(mr, mg, mb, 0.95)
+                cr.set_line_width(max(1.5, 1.4 * scale))
+                for l, t, r, b in rects:
+                    y_pos = ((t + b) / 2.0) * scale
+                    cr.move_to(l * scale, y_pos)
+                    cr.line_to(r * scale, y_pos)
+                cr.stroke()
+            elif m_type == "squiggly":
+                cr.set_source_rgba(mr, mg, mb, 0.95)
+                cr.set_line_width(max(1.2, 1.2 * scale))
+                for l, t, r, b in rects:
+                    y_base = (b - 2.0) * scale
+                    cur_x = l * scale
+                    end_x = r * scale
+                    wave_w = 4.0 * scale
+                    wave_h = 2.0 * scale
+                    up = True
+                    cr.move_to(cur_x, y_base)
+                    while cur_x < end_x:
+                        next_x = min(end_x, cur_x + wave_w / 2.0)
+                        next_y = y_base - wave_h if up else y_base + wave_h
+                        cr.line_to(next_x, next_y)
+                        cur_x = next_x
+                        up = not up
+                    cr.line_to(end_x, y_base)
+                cr.stroke()
+            cr.restore()
+
     def render_page_background(self, cr, doc, page, pw, ph, assets, templates, page_idx=0, with_background=True, with_pattern=True, optimize_for_printing=False):
         """Render only the static page background (paper color, PDF layer, xtemplate grid, flow text)."""
         dpi = float(doc.get("dpi", 150.0))
@@ -987,6 +1083,32 @@ class CanvasRendererMixin:
                     cr.set_source_surface(surf, 0, 0)
                     cr.paint()
                     cr.restore()
+
+            # Apply PDF Color Filters if configured (View menu parity with Android master)
+            pdf_filter = (
+                page.get("pdf_filter")
+                or doc.get("pdf_filter")
+                or doc.get("view_settings", {}).get("pdf_filter", "normal")
+            )
+            if pdf_filter in ("invert", "dark", "oled"):
+                cr.save()
+                cr.set_operator(cairo.OPERATOR_DIFFERENCE)
+                cr.set_source_rgb(1.0, 1.0, 1.0)
+                cr.rectangle(0, 0, pw, ph)
+                cr.fill()
+                cr.restore()
+            elif pdf_filter == "sepia":
+                cr.save()
+                cr.set_operator(cairo.OPERATOR_MULTIPLY)
+                cr.set_source_rgba(0.96, 0.90, 0.80, 1.0)
+                cr.rectangle(0, 0, pw, ph)
+                cr.fill()
+                cr.restore()
+
+            # Render text markups over the PDF layer
+            page_markups = page.get("markups") or []
+            if page_markups:
+                self.draw_markups(cr, page_markups, dpi=dpi)
 
         is_cover_page = bool(page.get("cover", False))
         t_ref = (
@@ -1221,8 +1343,15 @@ class CanvasRendererMixin:
             self.draw_text(cr, item)
         elif kind in ("image", "picture"):
             self.draw_image(cr, item, assets, templates)
-        elif kind == "shape":
-            self.draw_shape(cr, item)
+        elif kind in ("shape", "glyphs", "fill"):
+            if item.get("connector"):
+                self.draw_connector(cr, item)
+            else:
+                self.draw_shape(cr, item)
+        elif kind == "connector":
+            self.draw_connector(cr, item)
+        elif kind == "tape":
+            self.draw_tape(cr, item)
         elif kind == "audio":
             self.draw_audio_pill(cr, item)
 
@@ -1780,17 +1909,227 @@ class CanvasRendererMixin:
 
         cr.restore()
 
+    def draw_tape(self, cr, item):
+        """Renders TapeItem (spec 08): active recall tape in covered or peeled state."""
+        points = item.get("points") or []
+        if len(points) < 2:
+            rect = item.get("rect")
+            if rect and len(rect) >= 4:
+                x, y, w, h = float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3])
+                points = [[x, y + h / 2.0], [x + w, y + h / 2.0]]
+            else:
+                return
+
+        width = float(item.get("width", 32.0))
+        rgba = item.get("rgba") or [255, 230, 100, 255]
+        r = rgba[0] / 255.0
+        g = rgba[1] / 255.0
+        b = rgba[2] / 255.0
+        a = (rgba[3] / 255.0 if len(rgba) >= 4 else 1.0)
+        pattern = item.get("pattern", "stripes")
+        peeled = bool(item.get("peeled", False))
+
+        cr.save()
+        cr.set_line_width(width)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+
+        cr.new_path()
+        cr.move_to(float(points[0][0]), float(points[0][1]))
+        for pt in points[1:]:
+            cr.line_to(float(pt[0]), float(pt[1]))
+
+        if peeled:
+            # Peeled tape: dashed outline with completely transparent interior
+            cr.set_line_width(1.6)
+            cr.set_dash([7.0, 5.0])
+            cr.set_source_rgba(r, g, b, 0.75)
+            cr.stroke()
+            cr.restore()
+            return
+
+        # Covered tape: solid opaque body with pattern
+        cr.set_source_rgba(r, g, b, a * 0.95)
+        cr.stroke_preserve()
+
+        if pattern != "solid":
+            cr.save()
+            cr.clip()
+            xs = [float(p[0]) for p in points]
+            ys = [float(p[1]) for p in points]
+            min_x, max_x = min(xs) - width, max(xs) + width
+            min_y, max_y = min(ys) - width, max(ys) + width
+
+            pat_r, pat_g, pat_b, pat_a = r * 0.72, g * 0.72, b * 0.72, a * 0.55
+            cr.set_source_rgba(pat_r, pat_g, pat_b, pat_a)
+
+            if pattern == "stripes":
+                cr.set_line_width(6.0)
+                pitch = 14.0
+                diag_span = (max_x - min_x) + (max_y - min_y)
+                step = -diag_span
+                while step <= diag_span:
+                    cr.move_to(min_x + step, min_y - width)
+                    cr.line_to(min_x + step + (max_y - min_y) + 2 * width, max_y + width)
+                    step += pitch
+                cr.stroke()
+            elif pattern == "dots":
+                pitch = 12.0
+                rad = 2.2
+                row = 0
+                cy = min_y
+                while cy <= max_y:
+                    offset_x = (pitch / 2.0) if (row % 2 == 1) else 0.0
+                    cx = min_x + offset_x
+                    while cx <= max_x:
+                        cr.arc(cx, cy, rad, 0, 2 * math.pi)
+                        cr.fill()
+                        cx += pitch
+                    cy += pitch
+                    row += 1
+            elif pattern == "grid":
+                cr.set_line_width(1.4)
+                pitch = 12.0
+                cx = min_x
+                while cx <= max_x:
+                    cr.move_to(cx, min_y)
+                    cr.line_to(cx, max_y)
+                    cx += pitch
+                cy = min_y
+                while cy <= max_y:
+                    cr.move_to(min_x, cy)
+                    cr.line_to(max_x, cy)
+                    cy += pitch
+                cr.stroke()
+            cr.restore()
+
+        cr.new_path()
+        cr.restore()
+
+    def draw_connector(self, cr, item):
+        """Renders ConnectorItem (spec 08): parametric connector with routing, arrowheads, and label."""
+        points = item.get("points") or []
+        if len(points) < 2:
+            return
+
+        rgba = item.get("stroke_rgba") or item.get("rgba") or [80, 80, 80, 255]
+        r, g, b = rgba[0] / 255.0, rgba[1] / 255.0, rgba[2] / 255.0
+        a = (rgba[3] / 255.0 if len(rgba) >= 4 else 1.0)
+        sw = float(item.get("stroke_width", 2.2))
+
+        cr.save()
+        if item.get("neon"):
+            cr.save()
+            cr.set_line_width(sw * 3.4)
+            cr.set_source_rgba(r, g, b, 0.30)
+            cr.set_line_join(cairo.LINE_JOIN_ROUND)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            cr.move_to(float(points[0][0]), float(points[0][1]))
+            for pt in points[1:]:
+                cr.line_to(float(pt[0]), float(pt[1]))
+            cr.stroke()
+            cr.restore()
+
+        if item.get("dashed"):
+            cr.set_dash([float(item.get("dash_length", 8.0)), float(item.get("dash_gap", 6.0))])
+
+        cr.set_source_rgba(r, g, b, a)
+        cr.set_line_width(sw)
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        cr.set_line_cap(cairo.LINE_CAP_ROUND)
+
+        cr.new_path()
+        cr.move_to(float(points[0][0]), float(points[0][1]))
+        for pt in points[1:]:
+            cr.line_to(float(pt[0]), float(pt[1]))
+        cr.stroke()
+        cr.set_dash([])
+
+        def _draw_head(px, py, from_x, from_y, head_type):
+            if not head_type or head_type in ("none", ""):
+                return
+            angle = math.atan2(py - from_y, px - from_x)
+            alen = min(30.0, max(10.0, sw * 4.0))
+            a_ang = math.radians(28.0)
+            p1x = px - alen * math.cos(angle - a_ang)
+            p1y = py - alen * math.sin(angle - a_ang)
+            p2x = px - alen * math.cos(angle + a_ang)
+            p2y = py - alen * math.sin(angle + a_ang)
+            if head_type in ("arrow", "open"):
+                cr.move_to(p1x, p1y)
+                cr.line_to(px, py)
+                cr.line_to(p2x, p2y)
+                cr.stroke()
+            elif head_type in ("triangle", "hollow_triangle", "uml_inheritance"):
+                cr.move_to(p1x, p1y)
+                cr.line_to(px, py)
+                cr.line_to(p2x, p2y)
+                cr.close_path()
+                cr.set_source_rgba(1.0, 1.0, 1.0, 1.0)
+                cr.fill_preserve()
+                cr.set_source_rgba(r, g, b, a)
+                cr.stroke()
+            elif head_type in ("diamond", "filled_diamond"):
+                mid_x = px - alen * 1.5 * math.cos(angle)
+                mid_y = py - alen * 1.5 * math.sin(angle)
+                cr.move_to(px, py)
+                cr.line_to(p1x, p1y)
+                cr.line_to(mid_x, mid_y)
+                cr.line_to(p2x, p2y)
+                cr.close_path()
+                cr.set_source_rgba(r, g, b, a)
+                cr.fill()
+
+        _draw_head(float(points[-1][0]), float(points[-1][1]), float(points[-2][0]), float(points[-2][1]), item.get("head_end", "arrow"))
+        if item.get("head_start"):
+            _draw_head(float(points[0][0]), float(points[0][1]), float(points[1][0]), float(points[1][1]), item.get("head_start"))
+
+        label = item.get("label")
+        if label and isinstance(label, dict) and label.get("text"):
+            mid_idx = len(points) // 2
+            mx = (float(points[mid_idx - 1][0]) + float(points[mid_idx][0])) / 2.0
+            my = (float(points[mid_idx - 1][1]) + float(points[mid_idx][1])) / 2.0
+            l_text = label["text"]
+            layout = PangoCairo.create_layout(cr)
+            font_face = label.get("font_face", "sans")
+            pt_sz = label.get("point_size", 11.0)
+            desc = Pango.FontDescription.from_string(f"{font_face.capitalize()} {pt_sz}pt")
+            layout.set_font_description(desc)
+            layout.set_text(l_text, -1)
+            lw, lh = layout.get_pixel_size()
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.92)
+            cr.rectangle(mx - lw / 2.0 - 4.0, my - lh / 2.0 - 2.0, lw + 8.0, lh + 4.0)
+            cr.fill()
+            cr.set_source_rgba(r, g, b, a)
+            cr.move_to(mx - lw / 2.0, my - lh / 2.0)
+            PangoCairo.show_layout(cr, layout)
+
+        cr.restore()
+
     def draw_shape(self, cr, item, is_preview=False):
         rect = item.get("rect")
         if not rect or len(rect) < 4:
-            return
+            start = item.get("start") or item.get("start_pt")
+            end = item.get("end") or item.get("end_pt")
+            if start and end and len(start) >= 2 and len(end) >= 2:
+                sx, sy = float(start[0]), float(start[1])
+                ex, ey = float(end[0]), float(end[1])
+                rect = [min(sx, ex), min(sy, ey), max(1.0, abs(ex - sx)), max(1.0, abs(ey - sy))]
+            elif item.get("points"):
+                pts = item["points"]
+                xs = [float(p[0]) for p in pts]
+                ys = [float(p[1]) for p in pts]
+                rect = [min(xs), min(ys), max(1.0, max(xs) - min(xs)), max(1.0, max(ys) - min(ys))]
+            else:
+                return
+
         x, y, w, h = float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3])
         if w <= 0.0 and h <= 0.0:
             return
         w = max(1.0, w)
         h = max(1.0, h)
 
-        rgba = item.get("rgba") or [0, 0, 0, 255]
+        rgba = item.get("stroke_rgba") or item.get("rgba") or [0, 0, 0, 255]
         r = rgba[0] / 255.0
         g = rgba[1] / 255.0
         b = rgba[2] / 255.0
@@ -1799,9 +2138,10 @@ class CanvasRendererMixin:
             a = min(1.0, a * 0.88)
 
         stroke_w = float(item.get("stroke_width", 3.5))
-        fill = bool(item.get("fill", False))
-        shape_type = item.get("shape_type", "rectangle")
-        angle = float(item.get("angle", 0.0))
+        fill_rgba = item.get("fill_rgba")
+        fill = (fill_rgba is not None) or bool(item.get("fill", False))
+        shape_type = item.get("shape") or item.get("geom") or item.get("flip_geom") or item.get("shape_type", "rectangle")
+        angle = float(item.get("angle", item.get("rotation", 0.0)))
 
         cx = x + w / 2.0
         cy = y + h / 2.0
@@ -1813,6 +2153,19 @@ class CanvasRendererMixin:
         if angle != 0.0:
             cr.rotate(angle)
 
+        if item.get("neon"):
+            cr.save()
+            cr.set_line_width(stroke_w * 3.4)
+            cr.set_source_rgba(r, g, b, 0.32)
+            cr.set_line_join(cairo.LINE_JOIN_ROUND)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            cr.rectangle(-hw, -hh, w, h)
+            cr.stroke()
+            cr.restore()
+
+        if item.get("dashed"):
+            cr.set_dash([float(item.get("dash_length", 8.0)), float(item.get("dash_gap", 6.0))])
+
         cr.set_line_width(stroke_w)
         cr.set_line_cap(cairo.LINE_CAP_ROUND)
         cr.set_line_join(cairo.LINE_JOIN_ROUND)
@@ -1821,12 +2174,27 @@ class CanvasRendererMixin:
             if close:
                 cr.close_path()
             if fill:
-                cr.set_source_rgba(r, g, b, 0.22 if is_preview or not item.get("fill_solid") else a)
+                if fill_rgba and len(fill_rgba) >= 3:
+                    fr = fill_rgba[0] / 255.0
+                    fg = fill_rgba[1] / 255.0
+                    fb = fill_rgba[2] / 255.0
+                    fa = fill_rgba[3] / 255.0 if len(fill_rgba) >= 4 else 0.35
+                    cr.set_source_rgba(fr, fg, fb, fa)
+                else:
+                    cr.set_source_rgba(r, g, b, 0.22 if is_preview or not item.get("fill_solid") else a)
                 cr.fill_preserve()
             cr.set_source_rgba(r, g, b, a)
             cr.stroke()
 
-        if shape_type in ("rectangle", "rect", "square", "flow_process"):
+        if shape_type in ("polyline", "polygon") and item.get("points"):
+            pts = item["points"]
+            cr.new_path()
+            cr.move_to(float(pts[0][0]) - cx, float(pts[0][1]) - cy)
+            for p in pts[1:]:
+                cr.line_to(float(p[0]) - cx, float(p[1]) - cy)
+            _do_fill_and_stroke(close=(shape_type == "polygon"))
+
+        elif shape_type in ("rectangle", "rect", "square", "flow_process"):
             cr.rectangle(-hw, -hh, w, h)
             _do_fill_and_stroke(close=False)
 
@@ -2672,6 +3040,17 @@ class CanvasRendererMixin:
             a = 0.5
 
         base_width = float(cfg.get("base_width", stroke.get("stroke_width", stroke.get("width", 3.2))))
+        is_neon = bool(stroke.get("neon", False) or cfg.get("neon", False) or (tool == "neon"))
+        neon_s = float(stroke.get("neon_strength", cfg.get("neon_strength", 0.6)))
+        if is_neon and tool != "highlighter":
+            wide_r = max(6.0, base_width * (1.8 + 5.0 * neon_s))
+            wide_a = min(1.0, max(0.06, 0.42 * neon_s)) * a
+            tight_r = max(2.5, base_width * (0.7 + 1.8 * neon_s))
+            tight_a = min(1.0, max(0.18, 0.85 * neon_s)) * a
+            body_r = min(1.0, r + (1.0 - r) * 0.10)
+            body_g = min(1.0, g + (1.0 - g) * 0.10)
+            body_b = min(1.0, b + (1.0 - b) * 0.10)
+            core_frac = 0.30
 
         # 2. Dashed Line Tool ("dashed")
         if tool == "dashed" or "dash_length" in cfg:
@@ -2707,12 +3086,40 @@ class CanvasRendererMixin:
         ):
             pts = [(float(s["x"]), float(s["y"])) if isinstance(s, dict) else (float(s[0]), float(s[1])) for s in raw_samples]
             cr.save()
-            if a < 0.99:
+            cr.set_line_join(cairo.LINE_JOIN_ROUND)
+            cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            if is_neon and tool != "highlighter":
+                # Wide bloom
+                cr.set_source_rgba(r, g, b, wide_a)
+                cr.set_line_width(base_width + 2.0 * wide_r)
+                cr.new_path()
+                self._trace_quadratic_midpoint_spline(cr, pts)
+                cr.stroke()
+
+                # Tight bloom
+                cr.set_source_rgba(r, g, b, tight_a)
+                cr.set_line_width(base_width + 2.0 * tight_r)
+                cr.new_path()
+                self._trace_quadratic_midpoint_spline(cr, pts)
+                cr.stroke()
+
+                # Body
+                cr.set_source_rgba(body_r, body_g, body_b, a)
+                cr.set_line_width(base_width)
+                cr.new_path()
+                self._trace_quadratic_midpoint_spline(cr, pts)
+                cr.stroke()
+
+                # White core
+                cr.set_source_rgba(1.0, 1.0, 1.0, a)
+                cr.set_line_width(max(1.0, base_width * core_frac))
+                cr.new_path()
+                self._trace_quadratic_midpoint_spline(cr, pts)
+                cr.stroke()
+            elif a < 0.99:
                 cr.push_group()
                 cr.set_source_rgb(r, g, b)
                 cr.set_line_width(base_width)
-                cr.set_line_join(cairo.LINE_JOIN_ROUND)
-                cr.set_line_cap(cairo.LINE_CAP_ROUND)
                 cr.new_path()
                 self._trace_quadratic_midpoint_spline(cr, pts)
                 cr.stroke()
@@ -2721,8 +3128,6 @@ class CanvasRendererMixin:
             else:
                 cr.set_source_rgb(r, g, b)
                 cr.set_line_width(base_width)
-                cr.set_line_join(cairo.LINE_JOIN_ROUND)
-                cr.set_line_cap(cairo.LINE_CAP_ROUND)
                 cr.new_path()
                 self._trace_quadratic_midpoint_spline(cr, pts)
                 cr.stroke()
@@ -2743,17 +3148,37 @@ class CanvasRendererMixin:
                 stroke["_render_cache"] = {"n": len(raw_samples), "bw": base_width, "pts": pts, "radii": radii}
 
         cr.save()
-        self._draw_variable_width_envelope(cr, pts, radii)
+        if is_neon and tool != "highlighter":
+            # 1. Wide outer bloom
+            self._draw_variable_width_envelope(cr, pts, [rad + wide_r for rad in radii])
+            cr.set_source_rgba(r, g, b, wide_a)
+            cr.fill()
 
-        if a < 0.99:
-            cr.push_group()
-            cr.set_source_rgb(r, g, b)
+            # 2. Tight inner bloom
+            self._draw_variable_width_envelope(cr, pts, [rad + tight_r for rad in radii])
+            cr.set_source_rgba(r, g, b, tight_a)
             cr.fill()
-            cr.pop_group_to_source()
-            cr.paint_with_alpha(a)
+
+            # 3. Lit tube body
+            self._draw_variable_width_envelope(cr, pts, radii)
+            cr.set_source_rgba(body_r, body_g, body_b, a)
+            cr.fill()
+
+            # 4. White-hot core
+            self._draw_variable_width_envelope(cr, pts, [max(0.5, rad * core_frac) for rad in radii])
+            cr.set_source_rgba(1.0, 1.0, 1.0, a)
+            cr.fill()
         else:
-            cr.set_source_rgb(r, g, b)
-            cr.fill()
+            self._draw_variable_width_envelope(cr, pts, radii)
+            if a < 0.99:
+                cr.push_group()
+                cr.set_source_rgb(r, g, b)
+                cr.fill()
+                cr.pop_group_to_source()
+                cr.paint_with_alpha(a)
+            else:
+                cr.set_source_rgb(r, g, b)
+                cr.fill()
         cr.restore()
 
     def draw_stroke_fast(self, cr, stroke):

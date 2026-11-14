@@ -2,25 +2,38 @@ import os
 import re
 import math
 import json
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 import gi
 
 gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
-from gi.repository import Gtk, Adw, Gio, GLib, Gdk, GObject
+gi.require_version('Graphene', '1.0')
+gi.require_version('Pango', '1.0')
+from gi.repository import Gtk, Adw, Gio, GLib, Gdk, GObject, Graphene, Pango
 
 from xnote_io import XNotePackageParser
 from canvas_editor import XNoteCanvas
-from markdown_renderer import MarkdownRenderer, MarkdownInlineStyler
+from markdown_renderer import (
+    MarkdownRenderer,
+    MarkdownInlineStyler,
+    ScribeMarkdownView,
+    SCRIBE_BUILTIN_THEMES,
+    list_all_scribe_themes,
+    resolve_scribe_theme,
+    extract_markdown_headers,
+)
 
 from library_manager import LibraryManagerMixin
 from page_sidebar import PageSidebarMixin
 from template_switcher import TemplateSwitcherMixin
 from document_actions import DocumentActionsMixin
+from nextcloud_sync import NextcloudSyncClient
 
 
 TOOLS_WITH_SETTINGS = {
-    "speed", "velocity_pen", "pen", "calligraphy", "dashed", "taper", "shape", "highlighter", "eraser", "text"
+    "speed", "velocity_pen", "pen", "calligraphy", "dashed", "taper", "shape", "highlighter", "eraser", "text",
+    "neon", "tape", "connector", "insert_space"
 }
 
 
@@ -43,7 +56,7 @@ class XNotesViewerWindow(
         if os.path.isdir(self.icons_dir) and self.icons_dir not in self.icon_theme.get_search_path():
             self.icon_theme.add_search_path(self.icons_dir)
 
-        self.theme_mode = "system"
+        self.theme_mode = "auto"
         Adw.StyleManager.get_default().connect(
             "notify::dark", lambda sm, _: self._on_style_dark_changed(sm.get_dark())
         )
@@ -52,6 +65,16 @@ class XNotesViewerWindow(
         self.current_file_type = None  # "xnote", "xcanvas", "xtemplate", or "md"
         self.markdown_content = ""
         self.md_view_mode = "edit"  # Show editor view by default, not split pane
+        self.md_theme_id = "auto"
+        self.md_markup_visibility = "dim"  # Always dim
+        self.md_focus_mode = False
+        self.md_typewriter_mode = False
+        self.recent_colors = ["#d54425", "#1a6ed8", "#1e1e1e"]
+        self._pen_rgba = [213, 68, 37, 255]
+        self.autosave_enabled = True
+        self.autosave_interval = 30
+        self._autosave_timer_id = None
+        self.md_font_family = "sans"         # "sans", "serif", "mono"
         self._loading_md_buffer = False
         self._syncing_md_scroll = False
         self.md_search_matches = []
@@ -67,6 +90,14 @@ class XNotesViewerWindow(
         self.library_view_mode = "grid"   # "grid" or "list"
         self.library_sort_mode = "name_asc"  # "name_asc", "name_desc", "date_desc", "date_asc", "notebook", "type"
         self.show_markdown_files = True
+
+        # Optional Nextcloud WebDAV Sync (/Notebooks folder)
+        self.nextcloud_enabled = False
+        self.nextcloud_server_url = ""
+        self.nextcloud_username = ""
+        self.nextcloud_app_password = ""
+        self.nextcloud_auto_sync = True
+        self._nc_sync_in_progress = False
 
         self.is_modified = False
         self._force_closing = False
@@ -100,6 +131,15 @@ class XNotesViewerWindow(
             .page-badge.visible {
                 opacity: 1.0;
             }
+            .color-palette-box {
+                padding: 2px 4px;
+            }
+            .color-circle-btn {
+                min-width: 28px;
+                min-height: 28px;
+                padding: 0px;
+                border-radius: 9999px;
+            }
             .selection-toast {
                 background-color: #505053;
                 color: #ffffff;
@@ -128,6 +168,13 @@ class XNotesViewerWindow(
             }
             .selection-toast button.destructive-action:hover {
                 background-color: rgba(255, 123, 114, 0.25);
+            }
+            .floating-bottom-toolbar {
+                background-color: alpha(@headerbar_bg_color, 0.94);
+                border: 1px solid alpha(@borders, 0.65);
+                border-radius: 14px;
+                padding: 5px 8px;
+                box-shadow: 0 4px 16px rgba(0, 0, 0, 0.22), 0 1px 4px rgba(0, 0, 0, 0.14);
             }
             /* Default GNOME icon styling */
             .sidebar-section-header {
@@ -182,6 +229,22 @@ class XNotesViewerWindow(
                 background-color: alpha(@view_fg_color, 0.08);
                 opacity: 0.75;
             }
+            .color-pill {
+                font-size: 10px;
+                font-weight: 700;
+                padding: 2px 8px;
+                border-radius: 999px;
+                box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+            }
+            .color-swatch-circle {
+                min-width: 26px;
+                min-height: 26px;
+                padding: 2px;
+                border-radius: 9999px;
+            }
+            .color-swatch-circle:hover {
+                background-color: alpha(@view_fg_color, 0.12);
+            }
             .category-flowbox flowboxchild {
                 padding: 0;
                 margin: 0;
@@ -209,6 +272,31 @@ class XNotesViewerWindow(
             .page-sidebar-box {
                 background-color: @sidebar_bg_color;
                 border-right: 1px solid alpha(@borders, 0.55);
+            }
+            .md-sidebar-overlay-box {
+                background-color: @card_bg_color;
+                border-right: 1px solid alpha(@borders, 0.7);
+                box-shadow: 4px 0 16px rgba(0, 0, 0, 0.22);
+            }
+            .md-outline-row {
+                padding: 6px 8px;
+                border-radius: 8px;
+                margin: 2px 4px;
+            }
+            .md-outline-row:hover {
+                background-color: alpha(@theme_fg_color, 0.06);
+            }
+            .md-image-box {
+                margin: 12px 0px;
+            }
+            .md-preview-picture {
+                border-radius: 8px;
+            }
+            .md-image-placeholder {
+                padding: 12px 16px;
+                border: 1px dashed alpha(@borders, 0.8);
+                border-radius: 8px;
+                background-color: alpha(@view_fg_color, 0.04);
             }
             .page-sidebar-footer {
                 padding: 6px 8px;
@@ -324,10 +412,7 @@ class XNotesViewerWindow(
         import_submenu.append("Import from Rnote…", "win.import-rnote-new")
         sidebar_menu.append_submenu("Import", import_submenu)
 
-        # 3. Show Markdown Files (Check item in its own section)
-        md_section = Gio.Menu()
-        md_section.append("Show Markdown Files", "win.show-markdown")
-        sidebar_menu.append_section(None, md_section)
+        # Show Markdown Files & Nextcloud Sync are available in Preferences
 
         # 4, 5, 6. Preferences, Keyboard Shortcuts, About
         pref_section = Gio.Menu()
@@ -376,7 +461,7 @@ class XNotesViewerWindow(
         content_header.set_title_widget(title_box)
 
         self.library_sidebar_btn = Gtk.ToggleButton(
-            icon_name=self._resolve_icon_name("sidebar", "sidebar-show-symbolic"),
+            icon_name=self._resolve_icon_name("sidebar-show-symbolic", "sidebar-show-symbolic"),
             active=False,
             visible=False,
             tooltip_text="Toggle Categories Sidebar (F9)"
@@ -458,7 +543,19 @@ class XNotesViewerWindow(
         self.lib_list_btn.connect("toggled", self._on_library_view_mode_toggled, "list")
         lib_mode_box.append(self.lib_list_btn)
 
-        content_header.pack_end(lib_mode_box)
+        self.lib_mode_box = lib_mode_box
+        content_header.pack_end(self.lib_mode_box)
+
+        self.empty_trash_btn = Gtk.Button(
+            label="Empty Trash",
+            icon_name=self._resolve_icon_name("user-trash-symbolic", "user-trash-symbolic"),
+            tooltip_text="Empty Trash (Delete All Permanently)"
+        )
+        self.empty_trash_btn.add_css_class("flat")
+        self.empty_trash_btn.add_css_class("destructive-action")
+        self.empty_trash_btn.set_visible(False)
+        self.empty_trash_btn.connect("clicked", self.on_empty_trash_clicked)
+        content_header.pack_end(self.empty_trash_btn)
 
         content_toolbar.add_top_bar(content_header)
 
@@ -702,6 +799,54 @@ class XNotesViewerWindow(
         lib_loading_box.append(lib_loading_lbl)
         self.content_stack.add_named(lib_loading_box, "loading")
 
+        # 1d. Library Trash View
+        self.trash_scrolled = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        trash_outer = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            hexpand=True,
+            vexpand=True
+        )
+        trash_clamp = Adw.Clamp(
+            maximum_size=880,
+            tightening_threshold=600,
+            margin_start=24,
+            margin_end=24,
+            margin_top=20,
+            margin_bottom=28
+        )
+        trash_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+
+        trash_hint_lbl = Gtk.Label(
+            label="Items in Trash can be restored to their original folder.",
+            xalign=0.0
+        )
+        trash_hint_lbl.add_css_class("dim-label")
+        trash_box.append(trash_hint_lbl)
+
+        self.trash_listbox = Gtk.ListBox()
+        self.trash_listbox.add_css_class("boxed-list")
+        self.trash_listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        trash_box.append(self.trash_listbox)
+
+        trash_clamp.set_child(trash_box)
+        trash_outer.append(trash_clamp)
+        self.trash_scrolled.set_child(trash_outer)
+        self.content_stack.add_named(self.trash_scrolled, "trash")
+
+        # 1e. Empty state for Trash
+        self.empty_trash_page = Adw.StatusPage(
+            icon_name=self._resolve_icon_name("user-trash-symbolic", "user-trash-symbolic"),
+            title="Trash is Empty",
+            description="Items moved to trash will appear here"
+        )
+        empty_trash_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, halign=Gtk.Align.CENTER)
+        btn_trash_back = Gtk.Button(label="Back to Library")
+        btn_trash_back.add_css_class("pill")
+        btn_trash_back.connect("clicked", lambda *_: self._select_category("ALL"))
+        empty_trash_box.append(btn_trash_back)
+        self.empty_trash_page.set_child(empty_trash_box)
+        self.content_stack.add_named(self.empty_trash_page, "empty_trash")
+
         self.content_stack.set_visible_child_name("empty")
 
         if hasattr(Adw, "OverlaySplitView"):
@@ -750,7 +895,7 @@ class XNotesViewerWindow(
         viewer_toolbar.add_top_bar(viewer_header)
 
         self.back_btn = Gtk.Button(
-            icon_name=self._resolve_icon_name("prev", "go-previous-symbolic"),
+            icon_name=self._resolve_icon_name("go-previous-symbolic", "go-previous-symbolic"),
             tooltip_text="Back to Library (Esc)"
         )
         self.back_btn.connect("clicked", self.on_back_clicked)
@@ -764,6 +909,16 @@ class XNotesViewerWindow(
         )
         self.page_sidebar_btn.connect("toggled", self._on_page_sidebar_toggled_optimized)
         viewer_header.pack_start(self.page_sidebar_btn)
+
+        # Minimap Toggle Button (Infinite Canvas / .xcanvas)
+        self.minimap_btn = Gtk.ToggleButton(
+            icon_name=self._resolve_icon_name("find-location-symbolic", "view-grid-symbolic"),
+            active=True,
+            tooltip_text="Toggle Minimap"
+        )
+        self.minimap_btn.connect("toggled", self._on_minimap_toggled)
+        self.minimap_btn.set_visible(False)
+        viewer_header.pack_start(self.minimap_btn)
 
         save_menu = Gio.Menu()
         save_menu.append("Save", "win.save")
@@ -860,6 +1015,18 @@ class XNotesViewerWindow(
         fit_menu.append("Lock Zoom", "win.toggle-zoom-lock")
         fit_menu.append("Double Page View", "win.toggle-double-page")
 
+        pdf_filter_submenu = Gio.Menu()
+        pdf_filter_submenu.append("Normal (No Filter)", "win.pdf-filter-normal")
+        pdf_filter_submenu.append("Invert / Dark Filter", "win.pdf-filter-invert")
+        pdf_filter_submenu.append("Sepia Paper Tint", "win.pdf-filter-sepia")
+        pdf_filter_submenu.append("OLED Pure Black", "win.pdf-filter-oled")
+        fit_menu.append_submenu("PDF Color Filter", pdf_filter_submenu)
+
+        tape_submenu = Gio.Menu()
+        tape_submenu.append("Peel All Tape on Pages", "win.peel-all-tape")
+        tape_submenu.append("Cover All Tape on Pages", "win.cover-all-tape")
+        fit_menu.append_submenu("Active Recall Tape", tape_submenu)
+
         self.zoom_reset_btn = Gtk.MenuButton(
             label="100%",
             menu_model=fit_menu,
@@ -877,7 +1044,7 @@ class XNotesViewerWindow(
         self.zoom_box.append(self.zoom_in_btn)
 
         self.zoom_lock_btn = Gtk.ToggleButton(
-            icon_name=self._resolve_icon_name("unlock-symbolic"),
+            icon_name=self._resolve_icon_name("changes-allow-symbolic"),
             tooltip_text="Lock Zoom (Ctrl+L)"
         )
         self.zoom_lock_btn.connect("toggled", self._on_zoom_lock_toggled)
@@ -982,7 +1149,7 @@ class XNotesViewerWindow(
         self.page_tools_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         self.page_tools_box.add_css_class("linked")
         self.add_page_btn = Gtk.Button(
-            icon_name=self._resolve_icon_name("new-page-symbolic"),
+            icon_name=self._resolve_icon_name("add-page-symbolic"),
             tooltip_text="Add New Page After Last Page (Ctrl+N)"
         )
         self.add_page_btn.connect("clicked", self.on_add_page_clicked)
@@ -1016,14 +1183,14 @@ class XNotesViewerWindow(
         tool_group_box.add_css_class("linked")
 
         self.select_tool_btn = Gtk.ToggleButton(
-            icon_name=self._resolve_icon_name("tool-pointer-symbolic"),
+            icon_name=self._resolve_icon_name("pointer-symbolic"),
             tooltip_text="Select, Move, Resize & Rotate Images"
         )
         self.select_tool_btn.connect("toggled", self._on_tool_toggled, "select")
         tool_group_box.append(self.select_tool_btn)
 
         self.lasso_tool_btn = Gtk.ToggleButton(
-            icon_name=self._resolve_icon_name("tool-lasso-symbolic"),
+            icon_name=self._resolve_icon_name("lasso-symbolic"),
             group=self.select_tool_btn,
             tooltip_text="Freehand Lasso Select (Move, Scale & Recolor Strokes)"
         )
@@ -1103,6 +1270,38 @@ class XNotesViewerWindow(
         self.text_tool_btn.connect("toggled", self._on_tool_toggled, "text")
         tool_group_box.append(self.text_tool_btn)
 
+        self.neon_tool_btn = Gtk.ToggleButton(
+            icon_name=self._resolve_icon_name("neon-tool-symbolic", "magicWand-symbolic"),
+            group=self.select_tool_btn,
+            tooltip_text="Neon Glow Pen (Luminous bloom under bright core)"
+        )
+        self.neon_tool_btn.connect("toggled", self._on_tool_toggled, "neon")
+        tool_group_box.append(self.neon_tool_btn)
+
+        self.tape_tool_btn = Gtk.ToggleButton(
+            icon_name=self._resolve_icon_name("tape-symbolic", "draw-rectangle-symbolic"),
+            group=self.select_tool_btn,
+            tooltip_text="Active Recall Tape (Cover & Reveal study tool)"
+        )
+        self.tape_tool_btn.connect("toggled", self._on_tool_toggled, "tape")
+        tool_group_box.append(self.tape_tool_btn)
+
+        self.connector_tool_btn = Gtk.ToggleButton(
+            icon_name=self._resolve_icon_name("connector-symbolic", "go-next-symbolic"),
+            group=self.select_tool_btn,
+            tooltip_text="Parametric Connector (Arrows and links between objects)"
+        )
+        self.connector_tool_btn.connect("toggled", self._on_tool_toggled, "connector")
+        tool_group_box.append(self.connector_tool_btn)
+
+        self.space_tool_btn = Gtk.ToggleButton(
+            icon_name=self._resolve_icon_name("expand-vertical-symbolic", "edit-cut-symbolic"),
+            group=self.select_tool_btn,
+            tooltip_text="Insert Space (Drag down to insert room and push items)"
+        )
+        self.space_tool_btn.connect("toggled", self._on_tool_toggled, "insert_space")
+        tool_group_box.append(self.space_tool_btn)
+
         self.tool_buttons = {
             "select": self.select_tool_btn,
             "lasso": self.lasso_tool_btn,
@@ -1116,6 +1315,10 @@ class XNotesViewerWindow(
             "highlighter": self.hi_tool_btn,
             "eraser": self.eraser_tool_btn,
             "text": self.text_tool_btn,
+            "neon": self.neon_tool_btn,
+            "tape": self.tape_tool_btn,
+            "connector": self.connector_tool_btn,
+            "insert_space": self.space_tool_btn,
         }
 
         for btn, tname in [
@@ -1130,6 +1333,10 @@ class XNotesViewerWindow(
             (self.hi_tool_btn, "highlighter"),
             (self.eraser_tool_btn, "eraser"),
             (self.text_tool_btn, "text"),
+            (self.neon_tool_btn, "neon"),
+            (self.tape_tool_btn, "tape"),
+            (self.connector_tool_btn, "connector"),
+            (self.space_tool_btn, "insert_space"),
         ]:
             click = Gtk.GestureClick()
             click.set_button(0)
@@ -1137,7 +1344,16 @@ class XNotesViewerWindow(
             click.connect("released", self._on_tool_btn_released, tname, btn)
             btn.add_controller(click)
 
-        center_tools_box.append(tool_group_box)
+        # Floating bottom toolbar containing tools from Select to Insert Space (+ Ink Color)
+        self.floating_tools_bar = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=8,
+            halign=Gtk.Align.CENTER,
+            valign=Gtk.Align.END,
+            margin_bottom=16
+        )
+        self.floating_tools_bar.add_css_class("floating-bottom-toolbar")
+        self.floating_tools_bar.append(tool_group_box)
 
         insert_media_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         insert_media_box.add_css_class("linked")
@@ -1171,6 +1387,15 @@ class XNotesViewerWindow(
         self.audio_attach_btn.connect("clicked", self._on_attach_audio_clicked)
         insert_media_box.append(self.audio_attach_btn)
 
+        # Ink Color Palette (3 Recent Colors + Color Selector) on Top Toolbar
+        self.color_palette_box = self._build_color_palette()
+        center_tools_box.append(self.color_palette_box)
+
+        color_media_sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        color_media_sep.set_margin_start(4)
+        color_media_sep.set_margin_end(4)
+        center_tools_box.append(color_media_sep)
+
         center_tools_box.append(insert_media_box)
 
         # Active recording banner in the stylus toolbar
@@ -1193,20 +1418,11 @@ class XNotesViewerWindow(
         self.rec_banner.append(self.cancel_rec_btn)
         center_tools_box.append(self.rec_banner)
 
-        self.color_btn = Gtk.ColorButton(
-            tooltip_text="Stroke / Text Ink Color (Also Recolors Lasso Selection)"
-        )
-        rgba = Gdk.RGBA()
-        rgba.parse("rgb(213,68,37)")
-        self.color_btn.set_rgba(rgba)
-        self.color_btn.connect("color-set", self._on_color_changed)
-        center_tools_box.append(self.color_btn)
-
-        # Tool Settings Popover (directly attaches under active tool)
+        # Tool Settings Popover (directly attaches above active tool on bottom floating bar)
         self.tool_settings_popover = self._build_tool_settings_popover()
         self.tool_settings_popover.set_parent(self.pen_tool_btn)
 
-        # Shape Selection Drop-down List Popover (opens as soon as shape tool is clicked)
+        # Shape Selection Drop-down List Popover (opens above shape tool on bottom floating bar)
         self.shape_popover = self._build_shape_dropdown_popover()
         self.shape_popover.set_parent(self.shape_tool_btn)
 
@@ -1215,7 +1431,7 @@ class XNotesViewerWindow(
         self.img_ops_box.add_css_class("selection-toast")
         self.img_ops_box.set_halign(Gtk.Align.CENTER)
         self.img_ops_box.set_valign(Gtk.Align.END)
-        self.img_ops_box.set_margin_bottom(24)
+        self.img_ops_box.set_margin_bottom(74)
 
         self.aspect_lock_btn = Gtk.ToggleButton(
             icon_name=self._resolve_icon_name("view-pin-symbolic"),
@@ -1307,13 +1523,13 @@ class XNotesViewerWindow(
             ("format-text-bold-symbolic", "Bold (Ctrl+B)", "**", "**"),
             ("format-text-italic-symbolic", "Italic (Ctrl+I)", "*", "*"),
             ("format-text-strikethrough-symbolic", "Strikethrough (Ctrl+Shift+X)", "~~", "~~"),
-            (self._resolve_icon_name("code-context-symbolic", "utilities-terminal-symbolic"), "Inline Code (Ctrl+E)", "`", "`"),
+            ("inline-code-symbolic", "Inline Code (Ctrl+E)", "`", "`"),
             ("format-text-larger-symbolic", "Heading 1 (Ctrl+1)", "# ", ""),
             ("format-text-smaller-symbolic", "Heading 2 (Ctrl+2)", "## ", ""),
             ("view-list-bullet-symbolic", "Bullet List (Ctrl+Shift+L)", "- ", ""),
             (self._resolve_icon_name("view-list-ordered-symbolic", "view-list-symbolic"), "Numbered List", "1. ", ""),
             ("object-select-symbolic", "Task Checkbox", "- [ ] ", ""),
-            ("format-text-blockquote-symbolic", "Blockquote (Ctrl+Shift+Q)", "> ", ""),
+            ("quotation-symbolic", "Blockquote (Ctrl+Shift+Q)", "> ", ""),
             ("link-symbolic", "Insert Link (Ctrl+K)", "[", "](https://)"),
             ("list-remove-symbolic", "Horizontal Rule", "\n---\n", ""),
         ]
@@ -1321,11 +1537,48 @@ class XNotesViewerWindow(
             b = Gtk.Button(icon_name=icon_name, tooltip_text=tip)
             b.connect("clicked", self._on_md_format_clicked, prefix, suffix)
             fmt_box.append(b)
+            if icon_name == "link-symbolic":
+                doc_link_b = Gtk.Button(
+                    icon_name=self._resolve_icon_name("document-open-symbolic", "x-office-document-symbolic"),
+                    tooltip_text="Link Document Note (Ctrl+Shift+K)"
+                )
+                doc_link_b.connect("clicked", self.on_md_link_document_clicked)
+                fmt_box.append(doc_link_b)
+
+                img_b = Gtk.Button(
+                    icon_name=self._resolve_icon_name("insert-image-symbolic", "image-x-generic-symbolic"),
+                    tooltip_text="Import Image into Note (Ctrl+Shift+I)"
+                )
+                img_b.connect("clicked", self.on_md_import_image_clicked)
+                fmt_box.append(img_b)
 
         center_fmt_wrap.append(fmt_box)
 
-        # Find in Page toggle button
+        # Find in Page toggle button + Scribe Focus, Typewriter, Typography controls
         md_tools_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+
+        self.md_focus_btn = Gtk.ToggleButton(
+            icon_name=self._resolve_icon_name("eye-open-negative-filled-symbolic", "view-reveal-symbolic"),
+            tooltip_text="Focus Mode: Dim Non-Active Paragraphs"
+        )
+        self.md_focus_btn.connect("toggled", self._on_md_focus_mode_toggled)
+        md_tools_box.append(self.md_focus_btn)
+
+        self.md_typewriter_btn = Gtk.ToggleButton(
+            icon_name=self._resolve_icon_name("input-keyboard-symbolic", "format-justify-center-symbolic"),
+            tooltip_text="Typewriter Mode: Keep Cursor Centered Vertically"
+        )
+        self.md_typewriter_btn.set_active(getattr(self, "md_typewriter_mode", False))
+        self.md_typewriter_btn.connect("toggled", lambda b: self._on_md_typewriter_toggled(b))
+        md_tools_box.append(self.md_typewriter_btn)
+
+        self.md_scribe_popover = self._build_md_scribe_popover()
+        self.md_scribe_btn = Gtk.MenuButton(
+            icon_name=self._resolve_icon_name("font-x-generic-symbolic", "preferences-desktop-font-symbolic"),
+            popover=self.md_scribe_popover,
+            tooltip_text="Markdown Typography"
+        )
+        md_tools_box.append(self.md_scribe_btn)
 
         self.md_find_btn = Gtk.ToggleButton(
             icon_name="system-search-symbolic",
@@ -1529,12 +1782,15 @@ class XNotesViewerWindow(
             on_tool_change_cb=self._on_canvas_tool_change_requested
         )
         self.canvas.vadj = self.vadj
+        if hasattr(self, "_pen_rgba"):
+            self.canvas.pen_rgba = list(self._pen_rgba)
+        self._update_color_palette_ui()
 
         self.scrolled.set_child(self.canvas)
         self.viewer_overlay.set_child(self.scrolled)
 
         self.prev_btn = Gtk.Button(
-            icon_name=self._resolve_icon_name("prev-symbolic"),
+            icon_name=self._resolve_icon_name("go-previous-symbolic"),
             tooltip_text="Previous Page (Page Up)",
             halign=Gtk.Align.START,
             valign=Gtk.Align.CENTER,
@@ -1547,7 +1803,7 @@ class XNotesViewerWindow(
         self.viewer_overlay.add_overlay(self.prev_btn)
 
         self.next_btn = Gtk.Button(
-            icon_name=self._resolve_icon_name("next-symbolic"),
+            icon_name=self._resolve_icon_name("go-next-symbolic"),
             tooltip_text="Next Page (Page Down)",
             halign=Gtk.Align.END,
             valign=Gtk.Align.CENTER,
@@ -1562,7 +1818,7 @@ class XNotesViewerWindow(
         self.page_badge = Gtk.Box(
             halign=Gtk.Align.CENTER,
             valign=Gtk.Align.END,
-            margin_bottom=76
+            margin_bottom=124
         )
         self.page_badge.add_css_class("osd")
         self.page_badge.add_css_class("page-badge")
@@ -1573,6 +1829,7 @@ class XNotesViewerWindow(
         self.page_badge.append(self.page_label)
         self.viewer_overlay.add_overlay(self.page_badge)
         self.viewer_overlay.add_overlay(self.img_ops_box)
+        self.viewer_overlay.add_overlay(self.floating_tools_bar)
 
         self.canvas_workspace_box.append(self.viewer_overlay)
         self.viewer_stack.add_named(self.canvas_workspace_box, "canvas_doc")
@@ -1580,7 +1837,7 @@ class XNotesViewerWindow(
         # =====================================================================
         # 2d. Markdown Split Editor & Live Preview (.md / .markdown)
         # =====================================================================
-        self.md_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, wide_handle=False)
+        self.md_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, wide_handle=False, hexpand=True, vexpand=True)
         self.md_paned.set_shrink_start_child(True)
         self.md_paned.set_shrink_end_child(True)
         self.md_paned.set_resize_start_child(True)
@@ -1588,7 +1845,7 @@ class XNotesViewerWindow(
         self.md_paned.set_position(600)
 
         self.md_edit_scrolled = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
-        self.md_textview = Gtk.TextView(
+        self.md_textview = ScribeMarkdownView(
             wrap_mode=Gtk.WrapMode.WORD_CHAR,
             left_margin=64,
             right_margin=40,
@@ -1596,13 +1853,14 @@ class XNotesViewerWindow(
             bottom_margin=36,
             pixels_above_lines=3,
             pixels_below_lines=3,
-            monospace=True
+            monospace=False
         )
         self.md_textview.add_css_class("md-editor-view")
         self.md_buffer = self.md_textview.get_buffer()
         if hasattr(self.md_buffer, "set_enable_undo"):
             self.md_buffer.set_enable_undo(True)
         self.md_inline_styler = MarkdownInlineStyler(self.md_textview)
+        self.md_inline_styler.on_document_link_clicked = self.open_document_link
         self.md_buffer.connect("changed", self._on_md_buffer_changed)
         self.md_buffer.connect("notify::can-undo", lambda *_: self._sync_md_undo_redo_buttons())
         self.md_buffer.connect("notify::can-redo", lambda *_: self._sync_md_undo_redo_buttons())
@@ -1612,6 +1870,22 @@ class XNotesViewerWindow(
         md_key_ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         md_key_ctrl.connect("key-pressed", self._on_md_key_pressed)
         self.md_textview.add_controller(md_key_ctrl)
+
+        # Drag and Drop images directly into Markdown editor
+        md_drop_target = Gtk.DropTarget.new(Gio.File, Gdk.DragAction.COPY)
+        def _on_md_file_drop(target, gfile, x, y):
+            if isinstance(gfile, Gio.File) and gfile.get_path():
+                path = gfile.get_path()
+                ext = os.path.splitext(path)[1].lower()
+                if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"):
+                    self._insert_markdown_image(path)
+                    return True
+                elif ext in (".md", ".markdown", ".xnote", ".xcanvas"):
+                    self.open_document_link(path)
+                    return True
+            return False
+        md_drop_target.connect("drop", _on_md_file_drop)
+        self.md_textview.add_controller(md_drop_target)
 
         self.md_edit_scrolled.set_child(self.md_textview)
         self.md_paned.set_start_child(self.md_edit_scrolled)
@@ -1640,7 +1914,55 @@ class XNotesViewerWindow(
         self.md_scrolled.set_child(self.md_outer)
         self.md_paned.set_end_child(self.md_scrolled)
 
-        self.viewer_stack.add_named(self.md_paned, "markdown_doc")
+        # =====================================================================
+        # 2e. Markdown Split View with Libadwaita OverlaySplitView
+        # =====================================================================
+        self.md_split_view = Adw.OverlaySplitView(hexpand=True, vexpand=True)
+        self.md_split_view.set_min_sidebar_width(170)
+        self.md_split_view.set_max_sidebar_width(200)
+        self.md_split_view.set_sidebar_width_fraction(0.16)
+        self.md_split_view.set_pin_sidebar(True)
+        self.md_split_view.set_show_sidebar(False)
+
+        md_sidebar_toolbar = Adw.ToolbarView()
+        md_sidebar_header = Adw.HeaderBar()
+        md_sidebar_header.set_show_start_title_buttons(False)
+        md_sidebar_header.set_show_end_title_buttons(False)
+
+        self.md_sb_title = Adw.WindowTitle(title="Outline", subtitle="")
+        md_sidebar_header.set_title_widget(self.md_sb_title)
+
+        close_sb_btn = Gtk.Button(icon_name="window-close-symbolic", tooltip_text="Close Outline (F9)")
+        close_sb_btn.add_css_class("flat")
+        close_sb_btn.connect("clicked", lambda *_: self.page_sidebar_btn.set_active(False))
+        md_sidebar_header.pack_end(close_sb_btn)
+        md_sidebar_toolbar.add_top_bar(md_sidebar_header)
+
+        self.md_outline_scrolled = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            hexpand=True,
+            vexpand=True
+        )
+        self.md_outline_scrolled.set_propagate_natural_width(False)
+
+        self.md_outline_listbox = Gtk.ListBox()
+        self.md_outline_listbox.add_css_class("navigation-sidebar")
+        self.md_outline_listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.md_outline_listbox.connect("row-selected", self._on_md_outline_row_selected)
+        self.md_outline_scrolled.set_child(self.md_outline_listbox)
+        md_sidebar_toolbar.set_content(self.md_outline_scrolled)
+
+        self.md_split_view.set_sidebar(md_sidebar_toolbar)
+        self.md_split_view.set_content(self.md_paned)
+
+        self.md_split_view.connect(
+            "notify::show-sidebar",
+            lambda sv, _: self.page_sidebar_btn.set_active(sv.get_show_sidebar())
+            if hasattr(self, "page_sidebar_btn") and self.page_sidebar_btn.get_active() != sv.get_show_sidebar() else None
+        )
+
+        self.viewer_stack.add_named(self.md_split_view, "markdown_doc")
 
         self.root_stack.add_named(viewer_toolbar, "viewer")
         self.root_stack.set_visible_child_name("collection")
@@ -1658,11 +1980,13 @@ class XNotesViewerWindow(
         if hasattr(Adw, "Breakpoint"):
             bp_compact = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 820px"))
             bp_compact.add_setter(self.split_view, "collapsed", True)
+            bp_compact.add_setter(self.md_split_view, "collapsed", True)
             bp_compact.add_setter(self.history_box, "visible", False)
             bp_compact.add_setter(self.zoom_out_btn, "visible", False)
             bp_compact.add_setter(self.zoom_in_btn, "visible", False)
             bp_compact.add_setter(self.zoom_lock_btn, "visible", False)
             self.add_breakpoint(bp_compact)
+        self._update_autosave_timer()
 
     # =========================================================================
     # Libadwaita Spinner Helper & Async Thumbnail Scheduler
@@ -1745,13 +2069,33 @@ class XNotesViewerWindow(
         self._thumb_pending_queue.clear()
 
     def _on_page_sidebar_toggled_optimized(self, btn):
-        # Delegate to PageSidebarMixin's handler first
+        active = btn.get_active()
+        doc_type = self.viewer_stack.get_visible_child_name() if hasattr(self, "viewer_stack") else ""
+        if doc_type == "markdown_doc":
+            if hasattr(self, "md_split_view"):
+                if self.md_split_view.get_show_sidebar() != active:
+                    self.md_split_view.set_show_sidebar(active)
+                if active:
+                    self._rebuild_markdown_outline()
+                if getattr(self, "md_view_mode", "edit") == "split":
+                    def _rebalance_split():
+                        w = self.md_paned.get_width()
+                        if w > 10:
+                            self.md_paned.set_position(int(w * 0.50))
+                        return GLib.SOURCE_REMOVE
+                    GLib.timeout_add(260, _rebalance_split)
+            elif hasattr(self, "md_sidebar_revealer"):
+                self.md_sidebar_revealer.set_reveal_child(active)
+                if active:
+                    self._rebuild_markdown_outline()
+            return
+
         if hasattr(super(), "_on_page_sidebar_toggled"):
             super()._on_page_sidebar_toggled(btn)
         else:
-            self.page_sidebar_revealer.set_reveal_child(btn.get_active())
+            self.page_sidebar_revealer.set_reveal_child(active)
 
-        if btn.get_active():
+        if active:
             self._schedule_sidebar_thumbnails()
 
     def _on_page_sidebar_scroll_changed(self, _adj):
@@ -2100,7 +2444,47 @@ class XNotesViewerWindow(
         target_zoom = max(0.1, min((avail_h - 48.0) / ph, 4.0))
         self.set_zoom(target_zoom)
 
+    def _confirm_unsaved_changes(self, callback):
+        if not getattr(self, "is_modified", False) or not getattr(self, "current_file_path", None):
+            callback()
+            return
+
+        if getattr(self, "autosave_enabled", True):
+            self.save_document(silent=True)
+            callback()
+            return
+
+        base_name = os.path.basename(self.current_file_path)
+        dlg = Adw.AlertDialog(
+            heading="Save Changes?",
+            body=f"There are unsaved changes in '{base_name}'. Do you want to save them before leaving?"
+        )
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("discard", "Discard")
+        dlg.add_response("save", "Save")
+        dlg.set_response_appearance("discard", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("save")
+        dlg.set_close_response("cancel")
+
+        def _on_response(dialog, response):
+            if response == "save":
+                if self.save_document(silent=True):
+                    callback()
+            elif response == "discard":
+                self.is_modified = False
+                callback()
+
+        dlg.connect("response", _on_response)
+        dlg.present(self)
+
     def _on_window_close_request(self, *_):
+        if getattr(self, "_autosave_timer_id", None) is not None:
+            try:
+                GLib.source_remove(self._autosave_timer_id)
+            except Exception:
+                pass
+            self._autosave_timer_id = None
         if self._force_closing or not self.is_modified or self.root_stack.get_visible_child_name() != "viewer":
             return False
 
@@ -2220,7 +2604,13 @@ class XNotesViewerWindow(
 
         total_w = self.md_paned.get_width()
         if total_w <= 10:
-            total_w = self.get_width() or 1200
+            is_sb_open = False
+            if hasattr(self, "md_split_view"):
+                is_sb_open = self.md_split_view.get_show_sidebar()
+            elif hasattr(self, "md_sidebar_revealer"):
+                is_sb_open = self.md_sidebar_revealer.get_reveal_child()
+            sidebar_w = 180 if is_sb_open else 0
+            total_w = max(400, (self.get_width() or 1200) - sidebar_w)
 
         if prev_mode == "preview" or not self.md_edit_scrolled.get_visible():
             start_pos = 0
@@ -2279,18 +2669,436 @@ class XNotesViewerWindow(
         self.md_inline_styler.inline_render = btn.get_active()
         self.md_inline_styler.refresh()
 
+    def _refresh_md_preview(self):
+        if hasattr(self, "md_paper_box") and hasattr(self, "markdown_content"):
+            base_dir = os.path.dirname(self.current_file_path) if getattr(self, "current_file_path", None) else None
+            theme = self.md_inline_styler.current_theme if hasattr(self, "md_inline_styler") else None
+            MarkdownRenderer.populate_box(
+                self.md_paper_box,
+                self.markdown_content,
+                self.canvas.zoom_level,
+                theme=theme,
+                base_dir=base_dir,
+                on_link_clicked=self._on_preview_link_activated
+            )
+
+    def _on_preview_link_activated(self, uri: str) -> bool:
+        return self.open_document_link(uri)
+
     def _on_md_buffer_changed(self, buffer):
         if self._loading_md_buffer:
             return
         start, end = buffer.get_bounds()
         self.markdown_content = buffer.get_text(start, end, False)
-        MarkdownRenderer.populate_box(
-            self.md_paper_box, self.markdown_content, self.canvas.zoom_level
-        )
+        self._refresh_md_preview()
+        self._schedule_md_outline_rebuild()
         if self.md_search_bar.get_search_mode():
             self._update_md_search_matches(scroll_to_current=False)
         self._sync_md_undo_redo_buttons()
         self._on_canvas_modified(True)
+
+    # =========================================================================
+    # Markdown Document Outline & Navigation
+    # =========================================================================
+    def _rebuild_markdown_outline(self):
+        """Populate the Markdown document navigation sidebar with headers (H1..H6)."""
+        if not hasattr(self, "md_outline_listbox"):
+            return
+
+        self._updating_md_outline = True
+        try:
+            child = self.md_outline_listbox.get_first_child()
+            while child is not None:
+                nxt = child.get_next_sibling()
+                self.md_outline_listbox.remove(child)
+                child = nxt
+
+            headers = extract_markdown_headers(getattr(self, "markdown_content", ""))
+            count = len(headers)
+            if hasattr(self, "md_sb_title"):
+                self.md_sb_title.set_subtitle(f"{count} {'heading' if count == 1 else 'headings'}" if count > 0 else "")
+            elif hasattr(self, "md_outline_count_lbl"):
+                self.md_outline_count_lbl.set_label(f"{count} {'heading' if count == 1 else 'headings'}" if count > 0 else "")
+
+            if not headers:
+                empty_row = Gtk.ListBoxRow(selectable=False)
+                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin_top=24, margin_bottom=24)
+                lbl = Gtk.Label(label="No headings found", halign=Gtk.Align.CENTER)
+                lbl.add_css_class("dim-label")
+                lbl.add_css_class("caption")
+                hint = Gtk.Label(label="Add # Heading", halign=Gtk.Align.CENTER)
+                hint.add_css_class("caption")
+                hint.add_css_class("dim-label")
+                box.append(lbl)
+                box.append(hint)
+                empty_row.set_child(box)
+                self.md_outline_listbox.append(empty_row)
+                return
+
+            for h in headers:
+                row = Gtk.ListBoxRow()
+                row._header_info = h
+                row.add_css_class("md-outline-row")
+
+                lvl = h["level"]
+                indent = 6 + (lvl - 1) * 8
+
+                hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+                hbox.set_margin_start(indent)
+                hbox.set_margin_end(6)
+                hbox.set_margin_top(4)
+                hbox.set_margin_bottom(4)
+
+                badge = Gtk.Label(label=f"H{lvl}")
+                badge.add_css_class("dim-label")
+                badge.add_css_class("caption")
+                badge.set_size_request(18, -1)
+                hbox.append(badge)
+
+                title_lbl = Gtk.Label(
+                    label=h["title"],
+                    xalign=0.0,
+                    hexpand=True,
+                    ellipsize=Pango.EllipsizeMode.END,
+                    max_width_chars=16
+                )
+                if lvl == 1:
+                    title_lbl.add_css_class("heading")
+                elif lvl == 2:
+                    attrs = Pango.AttrList()
+                    attrs.insert(Pango.attr_weight_new(Pango.Weight.SEMIBOLD))
+                    title_lbl.set_attributes(attrs)
+
+                hbox.append(title_lbl)
+                row.set_child(hbox)
+                self.md_outline_listbox.append(row)
+        finally:
+            self._updating_md_outline = False
+
+    def _on_md_outline_row_selected(self, listbox, row):
+        if getattr(self, "_updating_md_outline", False):
+            return
+        if row is None or not hasattr(row, "_header_info"):
+            return
+        h_info = row._header_info
+        target_line = h_info["line"]
+        self._navigate_to_md_line(target_line)
+
+    def _navigate_to_md_line(self, line_num: int):
+        """Scroll both the editor and live preview to the target line number."""
+        # 1. Editor scroll & cursor position
+        if hasattr(self, "md_buffer") and hasattr(self, "md_textview"):
+            line_iter = self._iter_at_line(line_num)
+            self.md_buffer.place_cursor(line_iter)
+            if getattr(self, "md_typewriter_mode", False) and hasattr(self, "md_inline_styler") and self.md_inline_styler:
+                GLib.idle_add(self.md_inline_styler._center_cursor_line)
+            else:
+                self.md_textview.scroll_to_iter(line_iter, 0.05, True, 0.0, 0.05)
+            self.md_textview.grab_focus()
+
+        # 2. Preview scroll
+        if hasattr(self, "md_paper_box") and hasattr(self, "md_preview_vadj"):
+            heading_widgets = getattr(self.md_paper_box, "_heading_widgets", [])
+            target_widget = None
+            for w_line, w_widget in heading_widgets:
+                if w_line == line_num:
+                    target_widget = w_widget
+                    break
+            if target_widget is not None:
+                try:
+                    ok, pt = target_widget.compute_point(self.md_paper_box, Graphene.Point.zero())
+                    if ok:
+                        self.md_preview_vadj.set_value(max(0, pt.y - 10))
+                except Exception:
+                    pass
+
+    def _schedule_md_outline_rebuild(self):
+        if getattr(self, "_md_outline_rebuild_source", None):
+            GLib.source_remove(self._md_outline_rebuild_source)
+        def _do_rebuild():
+            self._md_outline_rebuild_source = None
+            is_showing = False
+            if hasattr(self, "md_split_view"):
+                is_showing = self.md_split_view.get_show_sidebar()
+            elif hasattr(self, "md_sidebar_revealer"):
+                is_showing = self.md_sidebar_revealer.get_reveal_child()
+            if is_showing:
+                self._rebuild_markdown_outline()
+            return GLib.SOURCE_REMOVE
+        self._md_outline_rebuild_source = GLib.timeout_add(300, _do_rebuild)
+
+    # =========================================================================
+    # Markdown Document Linking
+    # =========================================================================
+    def open_document_link(self, target: str) -> bool:
+        """Handle opening a clicked markdown document link, anchor link, or web URL."""
+        if not target:
+            return False
+
+        # 1. External Web / Mail links
+        if target.startswith(("http://", "https://", "mailto:")):
+            try:
+                Gio.AppInfo.launch_default_for_uri(target, None)
+                return True
+            except Exception as e:
+                self.show_error(f"Failed to open link: {e}")
+                return False
+
+        # 2. In-document anchor links: #heading-id or #heading text
+        if target.startswith("#"):
+            return self._navigate_to_md_anchor(target[1:])
+
+        # 3. Handle file:// URLs
+        clean_target = target[7:] if target.startswith("file://") else target
+
+        # Handle wiki-links with display text: [[target|label]]
+        if "|" in clean_target:
+            clean_target = clean_target.split("|", 1)[0].strip()
+
+        # Handle link with anchor: doc.md#anchor
+        anchor = None
+        if "#" in clean_target:
+            clean_target, anchor = clean_target.split("#", 1)
+
+        base_dir = os.path.dirname(self.current_file_path) if getattr(self, "current_file_path", None) else None
+        found_path = None
+
+        # Candidate A: relative to current file's folder
+        if base_dir:
+            cand = os.path.normpath(os.path.join(base_dir, clean_target))
+            if os.path.isfile(cand):
+                found_path = cand
+            else:
+                for ext in (".md", ".markdown", ".xnote", ".xcanvas"):
+                    if os.path.isfile(cand + ext):
+                        found_path = cand + ext
+                        break
+
+        # Candidate B: absolute path
+        if not found_path and os.path.isabs(clean_target):
+            if os.path.isfile(clean_target):
+                found_path = clean_target
+            else:
+                for ext in (".md", ".markdown", ".xnote", ".xcanvas"):
+                    if os.path.isfile(clean_target + ext):
+                        found_path = clean_target + ext
+                        break
+
+        # Candidate C: search in current notebook folder or library
+        if not found_path:
+            search_folders = []
+            if hasattr(self, "current_folder") and self.current_folder:
+                search_folders.append(self.current_folder)
+            if hasattr(self, "notebooks_root") and self.notebooks_root:
+                search_folders.append(self.notebooks_root)
+
+            target_base = os.path.basename(clean_target)
+            for s_dir in search_folders:
+                if not os.path.isdir(s_dir):
+                    continue
+                direct = os.path.join(s_dir, target_base)
+                if os.path.isfile(direct):
+                    found_path = direct
+                    break
+                for ext in (".md", ".markdown", ".xnote", ".xcanvas"):
+                    if os.path.isfile(direct + ext):
+                        found_path = direct + ext
+                        break
+                if found_path:
+                    break
+                for root, _dirs, files in os.walk(s_dir):
+                    for f in files:
+                        f_lower = f.lower()
+                        t_lower = target_base.lower()
+                        if f_lower == t_lower or f_lower == t_lower + ".md":
+                            found_path = os.path.join(root, f)
+                            break
+                    if found_path:
+                        break
+
+        if found_path:
+            self.load_document(found_path)
+            if anchor:
+                GLib.idle_add(self._navigate_to_md_anchor, anchor)
+            self.show_toast(f"Opened {os.path.basename(found_path)}")
+            return True
+
+        # Document does not exist: prompt to create it if it's a markdown note
+        self._prompt_create_linked_document(clean_target, base_dir)
+        return True
+
+    def _navigate_to_md_anchor(self, anchor: str) -> bool:
+        """Find matching heading by slug or text and jump to it."""
+        norm_anchor = re.sub(r'[^a-zA-Z0-9]', '', anchor.lower())
+        headers = extract_markdown_headers(getattr(self, "markdown_content", ""))
+        for h in headers:
+            h_norm = re.sub(r'[^a-zA-Z0-9]', '', h["title"].lower())
+            if norm_anchor in h_norm or h_norm in norm_anchor:
+                self._navigate_to_md_line(h["line"])
+                return True
+        return False
+
+    def _prompt_create_linked_document(self, name: str, base_dir: Optional[str]):
+        """Prompt to create a new note if linked document doesn't exist."""
+        clean_name = os.path.basename(name).strip()
+        if not clean_name.lower().endswith((".md", ".markdown")):
+            clean_name += ".md"
+        target_dir = base_dir if (base_dir and os.path.isdir(base_dir)) else getattr(self, "current_folder", os.path.expanduser("~"))
+        target_path = os.path.join(target_dir, clean_name)
+
+        if hasattr(Adw, "MessageDialog"):
+            dialog = Adw.MessageDialog(
+                transient_for=self,
+                heading="Create Note?",
+                body=f"Linked document \"{clean_name}\" does not exist. Would you like to create it now?"
+            )
+            dialog.add_response("cancel", "Cancel")
+            dialog.add_response("create", "Create Note")
+            dialog.set_response_appearance("create", Adw.ResponseAppearance.SUGGESTED)
+
+            def _on_response(_d, resp):
+                if resp == "create":
+                    try:
+                        title_heading = f"# {os.path.splitext(clean_name)[0]}\n\n"
+                        with open(target_path, "w", encoding="utf-8") as f:
+                            f.write(title_heading)
+                        self.load_document(target_path)
+                        self.show_toast(f"Created and opened {clean_name}")
+                    except Exception as err:
+                        self.show_error(f"Failed to create note: {err}")
+
+            dialog.connect("response", _on_response)
+            dialog.present()
+        else:
+            self.show_toast(f"Document not found: {clean_name}")
+
+    def on_md_link_document_clicked(self, *_):
+        """Open file dialog to pick an existing document/note and insert markdown link at cursor."""
+        if hasattr(Gtk, "FileDialog"):
+            dialog = Gtk.FileDialog(title="Link Document Note")
+            filters = Gio.ListStore.new(Gtk.FileFilter)
+            doc_filter = Gtk.FileFilter()
+            doc_filter.set_name("Notes & Notebooks (*.md, *.markdown, *.xnote, *.xcanvas)")
+            for pat in ("*.md", "*.markdown", "*.xnote", "*.xcanvas"):
+                doc_filter.add_pattern(pat)
+            filters.append(doc_filter)
+            dialog.set_filters(filters)
+            if getattr(self, "current_file_path", None):
+                try:
+                    dialog.set_initial_folder(Gio.File.new_for_path(os.path.dirname(self.current_file_path)))
+                except Exception:
+                    pass
+            dialog.open(self, None, self._on_md_link_document_selected)
+        else:
+            self.show_error("Gtk.FileDialog is required to link documents.")
+
+    def _on_md_link_document_selected(self, dialog, result):
+        try:
+            gfile = dialog.open_finish(result)
+            if not gfile or not gfile.get_path():
+                return
+            target_path = gfile.get_path()
+            self._insert_document_link(target_path)
+        except GLib.Error:
+            pass
+        except Exception as e:
+            self.show_error(f"Failed to link document: {e}")
+
+    def _insert_document_link(self, target_path: str):
+        note_path = getattr(self, "current_file_path", None)
+        if note_path and os.path.isfile(note_path):
+            base_dir = os.path.dirname(os.path.abspath(note_path))
+            try:
+                rel_path = os.path.relpath(target_path, base_dir)
+            except Exception:
+                rel_path = target_path
+        else:
+            rel_path = os.path.basename(target_path)
+
+        buf = self.md_buffer
+        bounds = buf.get_selection_bounds()
+        if bounds:
+            start, end = bounds
+            label = buf.get_text(start, end, False).strip()
+            buf.delete(start, end)
+        else:
+            label = os.path.splitext(os.path.basename(target_path))[0]
+
+        link_snippet = f"[{label}]({rel_path})"
+        buf.begin_user_action()
+        buf.insert_at_cursor(link_snippet, len(link_snippet.encode("utf-8")))
+        buf.end_user_action()
+        self.md_textview.grab_focus()
+        self.show_toast(f"Linked document: {label}")
+
+    # =========================================================================
+    # Markdown Image Import
+    # =========================================================================
+    def on_md_import_image_clicked(self, *_):
+        """Import an image file and insert markdown image tag ![alt](path) into the note."""
+        if hasattr(Gtk, "FileDialog"):
+            dialog = Gtk.FileDialog(title="Import Image into Markdown Note")
+            filters = Gio.ListStore.new(Gtk.FileFilter)
+            img_filter = Gtk.FileFilter()
+            img_filter.set_name("Images (PNG, JPEG, WEBP, GIF, SVG)")
+            for pat in ("*.png", "*.jpg", "*.jpeg", "*.webp", "*.gif", "*.svg"):
+                img_filter.add_pattern(pat)
+            filters.append(img_filter)
+            dialog.set_filters(filters)
+            if getattr(self, "current_file_path", None):
+                try:
+                    dialog.set_initial_folder(Gio.File.new_for_path(os.path.dirname(self.current_file_path)))
+                except Exception:
+                    pass
+            dialog.open(self, None, self._on_md_import_image_selected)
+        else:
+            self.show_error("Gtk.FileDialog is required to import images.")
+
+    def _on_md_import_image_selected(self, dialog, result):
+        try:
+            gfile = dialog.open_finish(result)
+            if not gfile or not gfile.get_path():
+                return
+            src_path = gfile.get_path()
+            self._insert_markdown_image(src_path)
+        except GLib.Error:
+            pass
+        except Exception as e:
+            self.show_error(f"Failed to import image: {e}")
+
+    def _insert_markdown_image(self, src_path: str):
+        """Copy image to note's assets folder if needed and insert ![alt](rel_path) at cursor."""
+        note_path = getattr(self, "current_file_path", None)
+        alt_name = os.path.splitext(os.path.basename(src_path))[0]
+
+        if note_path and os.path.isfile(note_path):
+            note_dir = os.path.dirname(os.path.abspath(note_path))
+            src_abs = os.path.abspath(src_path)
+            if src_abs.startswith(note_dir + os.sep):
+                rel_path = os.path.relpath(src_abs, note_dir)
+            else:
+                assets_dir = os.path.join(note_dir, ".assets")
+                os.makedirs(assets_dir, exist_ok=True)
+                dest_filename = os.path.basename(src_path)
+                dest_path = os.path.join(assets_dir, dest_filename)
+                base_stem, ext = os.path.splitext(dest_filename)
+                counter = 1
+                while os.path.exists(dest_path) and os.path.abspath(dest_path) != src_abs:
+                    dest_path = os.path.join(assets_dir, f"{base_stem}_{counter}{ext}")
+                    counter += 1
+                if os.path.abspath(dest_path) != src_abs:
+                    shutil.copy2(src_path, dest_path)
+                rel_path = os.path.relpath(dest_path, note_dir)
+        else:
+            rel_path = src_path
+
+        img_tag = f"![{alt_name}]({rel_path})\n"
+        buf = self.md_buffer
+        buf.begin_user_action()
+        buf.insert_at_cursor(img_tag, len(img_tag.encode("utf-8")))
+        buf.end_user_action()
+        self.md_textview.grab_focus()
+        self.show_toast(f"Imported image: {os.path.basename(src_path)}")
 
     def _toggle_line_block_format(self, prefix: str):
         buf = self.md_buffer
@@ -2480,6 +3288,13 @@ class XNotesViewerWindow(
 
         self.md_textview.grab_focus()
 
+    def _scroll_or_center_md_cursor(self):
+        buf = getattr(self, "md_buffer", None)
+        if getattr(self, "md_typewriter_mode", False) and hasattr(self, "md_inline_styler") and self.md_inline_styler:
+            GLib.idle_add(self.md_inline_styler._center_cursor_line)
+        elif buf and hasattr(self, "md_textview"):
+            self._scroll_or_center_md_cursor()
+
     def _handle_md_return_key(self) -> bool:
         buf = self.md_buffer
         if buf.get_selection_bounds():
@@ -2510,7 +3325,7 @@ class XNotesViewerWindow(
                 buf.begin_user_action()
                 buf.insert_at_cursor(continuation, len(continuation.encode("utf-8")))
                 buf.end_user_action()
-                self.md_textview.scroll_mark_onscreen(buf.get_insert())
+                self._scroll_or_center_md_cursor()
                 return True
 
         ul_match = re.match(r'^(\s*)([-*+])\s+(.*)$', full_line)
@@ -2526,7 +3341,7 @@ class XNotesViewerWindow(
                 buf.begin_user_action()
                 buf.insert_at_cursor(continuation, len(continuation.encode("utf-8")))
                 buf.end_user_action()
-                self.md_textview.scroll_mark_onscreen(buf.get_insert())
+                self._scroll_or_center_md_cursor()
                 return True
 
         ol_match = re.match(r'^(\s*)(\d+)\.\s+(.*)$', full_line)
@@ -2543,7 +3358,7 @@ class XNotesViewerWindow(
                 buf.begin_user_action()
                 buf.insert_at_cursor(continuation, len(continuation.encode("utf-8")))
                 buf.end_user_action()
-                self.md_textview.scroll_mark_onscreen(buf.get_insert())
+                self._scroll_or_center_md_cursor()
                 return True
 
         return False
@@ -2620,6 +3435,14 @@ class XNotesViewerWindow(
 
         if key_lower == "k" and not shift:
             self._on_md_format_clicked(None, "[", "](https://)")
+            return True
+
+        if key_lower == "k" and shift:
+            self.on_md_link_document_clicked()
+            return True
+
+        if key_lower == "i" and shift:
+            self.on_md_import_image_clicked()
             return True
 
         if key_lower == "q" and shift:
@@ -2835,7 +3658,7 @@ class XNotesViewerWindow(
                 self.tool_settings_popover.unparent()
             self.tool_settings_popover.set_parent(target_btn)
 
-        self.tool_settings_popover.set_position(Gtk.PositionType.BOTTOM)
+        self.tool_settings_popover.set_position(Gtk.PositionType.TOP)
         self.tool_settings_popover.popup()
 
     def _show_shape_dropdown(self):
@@ -2854,7 +3677,7 @@ class XNotesViewerWindow(
 
     def _build_shape_dropdown_popover(self):
         popover = Gtk.Popover()
-        popover.set_position(Gtk.PositionType.BOTTOM)
+        popover.set_position(Gtk.PositionType.TOP)
 
         container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         container.set_size_request(280, 390)
@@ -3026,27 +3849,229 @@ class XNotesViewerWindow(
             if hasattr(self, "page_sidebar_btn") and self.page_sidebar_btn.get_visible():
                 self.page_sidebar_btn.set_active(not self.page_sidebar_btn.get_active())
 
-    def _on_color_changed(self, color_btn):
-        rgba = color_btn.get_rgba()
-        new_rgba = [
-            int(round(rgba.red * 255)),
-            int(round(rgba.green * 255)),
-            int(round(rgba.blue * 255)),
-            255
-        ]
-        self.canvas.pen_rgba = new_rgba
+    def _get_pen_rgba(self):
+        if hasattr(self, "canvas") and hasattr(self.canvas, "pen_rgba"):
+            return self.canvas.pen_rgba
+        return getattr(self, "_pen_rgba", [213, 68, 37, 255])
 
-        if self.canvas.has_lasso_selection():
-            if self.canvas.recolor_lasso_selection(new_rgba):
-                self._queue_redraw_current_sidebar_thumb()
-                self.show_toast("Recolored selected strokes")
+    def _build_color_palette(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        box.add_css_class("color-palette-box")
+        box.set_valign(Gtk.Align.CENTER)
+        box.set_halign(Gtk.Align.CENTER)
+
+        self.recent_color_buttons = []
+        for i in range(3):
+            btn = Gtk.Button()
+            btn.add_css_class("circular")
+            btn.add_css_class("flat")
+            btn.add_css_class("color-circle-btn")
+            btn.set_can_focus(False)
+
+            da = Gtk.DrawingArea()
+            da.set_content_width(20)
+            da.set_content_height(20)
+            da.set_halign(Gtk.Align.CENTER)
+            da.set_valign(Gtk.Align.CENTER)
+            da.set_draw_func(self._draw_recent_color_swatch, i)
+            btn.set_child(da)
+
+            btn.connect("clicked", self._on_recent_color_btn_clicked, i)
+            box.append(btn)
+            self.recent_color_buttons.append((btn, da))
+
+        self.color_picker_btn = Gtk.Button(
+            icon_name=self._resolve_icon_name("color-select-symbolic", "applications-graphics-symbolic"),
+            tooltip_text="Choose Custom Ink Color…"
+        )
+        self.color_picker_btn.add_css_class("circular")
+        self.color_picker_btn.add_css_class("flat")
+        self.color_picker_btn.add_css_class("color-circle-btn")
+        self.color_picker_btn.connect("clicked", self._open_color_picker)
+        box.append(self.color_picker_btn)
+
+        # Backwards compatibility alias & RGBA helper methods
+        self.color_btn = self.color_picker_btn
+        def _get_rgba():
+            rgba = Gdk.RGBA()
+            pen_rgb = self._get_pen_rgba()
+            rgba.red = pen_rgb[0] / 255.0
+            rgba.green = pen_rgb[1] / 255.0
+            rgba.blue = pen_rgb[2] / 255.0
+            rgba.alpha = 1.0
+            return rgba
+        def _set_rgba(rgba):
+            new_rgba = [
+                int(round(rgba.red * 255)),
+                int(round(rgba.green * 255)),
+                int(round(rgba.blue * 255)),
+                255
+            ]
+            self._apply_pen_color(new_rgba, add_to_recents=True)
+        self.color_picker_btn.get_rgba = _get_rgba
+        self.color_picker_btn.set_rgba = _set_rgba
+
+        self._update_color_palette_ui()
+        return box
+
+    def _draw_recent_color_swatch(self, area, cr, width, height, idx):
+        if not hasattr(self, "recent_colors") or idx >= len(self.recent_colors):
+            return
+        hex_c = self.recent_colors[idx]
+        try:
+            r = int(hex_c[1:3], 16) / 255.0
+            g = int(hex_c[3:5], 16) / 255.0
+            b = int(hex_c[5:7], 16) / 255.0
+        except Exception:
+            r, g, b = 0.83, 0.26, 0.14
+
+        pen_rgb = self._get_pen_rgba()
+        curr_hex = f"#{pen_rgb[0]:02x}{pen_rgb[1]:02x}{pen_rgb[2]:02x}"
+        is_active = (curr_hex.lower() == hex_c.lower())
+
+        cx = width / 2.0
+        cy = height / 2.0
+
+        if is_active:
+            # Concentric active ring around selected swatch
+            cr.arc(cx, cy, min(cx, cy) - 1.0, 0, 2 * math.pi)
+            cr.set_line_width(1.8)
+            cr.set_source_rgba(r, g, b, 0.95)
+            cr.stroke()
+            r_swatch = min(cx, cy) - 3.5
         else:
-            sel_item = self.canvas.get_selected_item()
-            if sel_item and (sel_item.get("kind") or sel_item.get("type")) in ("shape", "text"):
-                sel_item["rgba"] = list(new_rgba)
-                self.canvas.invalidate_page(self.canvas.selected_page_idx, clear_bg=False)
-                self.canvas.queue_draw()
-                self._queue_redraw_current_sidebar_thumb()
+            r_swatch = min(cx, cy) - 2.0
+
+        cr.arc(cx, cy, max(2.0, r_swatch), 0, 2 * math.pi)
+        cr.set_source_rgb(r, g, b)
+        cr.fill_preserve()
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.25)
+        cr.set_line_width(0.75)
+        cr.stroke()
+
+    def _update_color_palette_ui(self):
+        if not hasattr(self, "recent_color_buttons"):
+            return
+        pen_rgb = self._get_pen_rgba()
+        curr_hex = f"#{pen_rgb[0]:02x}{pen_rgb[1]:02x}{pen_rgb[2]:02x}"
+
+        for i, (btn, da) in enumerate(self.recent_color_buttons):
+            if i < len(self.recent_colors):
+                c = self.recent_colors[i]
+                btn.set_tooltip_text(f"Recent Ink Color: {c}")
+                btn.set_visible(True)
+                da.queue_draw()
+            else:
+                btn.set_visible(False)
+
+        if hasattr(self, "color_picker_btn") and self.color_picker_btn:
+            self.color_picker_btn.set_tooltip_text(f"Choose Custom Ink Color… (Current: {curr_hex})")
+
+    def _on_recent_color_btn_clicked(self, _btn, idx):
+        if not hasattr(self, "recent_colors") or idx >= len(self.recent_colors):
+            return
+        hex_c = self.recent_colors[idx]
+        try:
+            r = int(hex_c[1:3], 16)
+            g = int(hex_c[3:5], 16)
+            b = int(hex_c[5:7], 16)
+            self._apply_pen_color([r, g, b, 255], add_to_recents=False)
+        except Exception as e:
+            print(f"Failed to apply recent color {hex_c}: {e}")
+
+    def _open_color_picker(self, _btn=None):
+        initial = Gdk.RGBA()
+        pen_rgb = self._get_pen_rgba()
+        initial.red = pen_rgb[0] / 255.0
+        initial.green = pen_rgb[1] / 255.0
+        initial.blue = pen_rgb[2] / 255.0
+        initial.alpha = 1.0
+
+        if hasattr(Gtk, "ColorDialog"):
+            dialog = Gtk.ColorDialog.new()
+            dialog.set_title("Choose Ink Color")
+            dialog.set_modal(True)
+            dialog.set_with_alpha(False)
+
+            def _on_finish(d, res):
+                try:
+                    rgba = d.choose_rgba_finish(res)
+                    if rgba:
+                        new_rgba = [
+                            int(round(rgba.red * 255)),
+                            int(round(rgba.green * 255)),
+                            int(round(rgba.blue * 255)),
+                            255
+                        ]
+                        self._apply_pen_color(new_rgba, add_to_recents=True)
+                except Exception:
+                    pass
+
+            dialog.choose_rgba(self, initial, None, _on_finish)
+        else:
+            chooser = Gtk.ColorChooserDialog(title="Choose Ink Color", transient_for=self, modal=True)
+            chooser.set_rgba(initial)
+            chooser.set_use_alpha(False)
+
+            def _on_response(dlg, resp):
+                if resp == Gtk.ResponseType.OK:
+                    rgba = dlg.get_rgba()
+                    new_rgba = [
+                        int(round(rgba.red * 255)),
+                        int(round(rgba.green * 255)),
+                        int(round(rgba.blue * 255)),
+                        255
+                    ]
+                    self._apply_pen_color(new_rgba, add_to_recents=True)
+                dlg.destroy()
+
+            chooser.connect("response", _on_response)
+            chooser.present()
+
+    def _apply_pen_color(self, new_rgba, add_to_recents=True):
+        self._pen_rgba = list(new_rgba)
+        if hasattr(self, "canvas"):
+            self.canvas.pen_rgba = list(new_rgba)
+        hex_c = f"#{new_rgba[0]:02x}{new_rgba[1]:02x}{new_rgba[2]:02x}"
+
+        if not hasattr(self, "recent_colors"):
+            self.recent_colors = ["#d54425", "#1a6ed8", "#1e1e1e"]
+
+        if add_to_recents:
+            if hex_c in self.recent_colors:
+                self.recent_colors.remove(hex_c)
+            self.recent_colors.insert(0, hex_c)
+            self.recent_colors = self.recent_colors[:3]
+
+        self._update_color_palette_ui()
+
+        if hasattr(self, "canvas"):
+            if self.canvas.has_lasso_selection():
+                if self.canvas.recolor_lasso_selection(new_rgba):
+                    self._queue_redraw_current_sidebar_thumb()
+                    self.show_toast("Recolored selected strokes")
+            else:
+                sel_item = self.canvas.get_selected_item()
+                if sel_item and (sel_item.get("kind") or sel_item.get("type")) in ("shape", "text"):
+                    sel_item["rgba"] = list(new_rgba)
+                    self.canvas.invalidate_page(self.canvas.selected_page_idx, clear_bg=False)
+                    self.canvas.queue_draw()
+                    self._queue_redraw_current_sidebar_thumb()
+            self.canvas.queue_draw()
+        self.save_config()
+
+    def _on_color_changed(self, color_btn):
+        if hasattr(color_btn, "get_rgba"):
+            rgba = color_btn.get_rgba()
+            new_rgba = [
+                int(round(rgba.red * 255)),
+                int(round(rgba.green * 255)),
+                int(round(rgba.blue * 255)),
+                255
+            ]
+            self._apply_pen_color(new_rgba, add_to_recents=True)
+        else:
+            self._open_color_picker()
 
     def _on_width_changed(self, scale):
         val = scale.get_value()
@@ -3086,7 +4111,7 @@ class XNotesViewerWindow(
     def _build_tool_settings_popover(self):
         popover = Gtk.Popover()
         popover.set_autohide(True)
-        popover.set_position(Gtk.PositionType.BOTTOM)
+        popover.set_position(Gtk.PositionType.TOP)
         popover.connect("show", lambda *_: self._refresh_tool_settings_popover())
 
         self.tool_settings_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -3122,6 +4147,10 @@ class XNotesViewerWindow(
             "highlighter": ("Highlighter", "tool-highlighter-symbolic"),
             "eraser": ("Stroke & Text Eraser", "tool-eraser-symbolic"),
             "text": ("Text Box Tool", "tool-text-symbolic"),
+            "neon": ("Neon Glow Pen", "magic-wand-symbolic"),
+            "tape": ("Active Recall Tape", "bookmark-symbolic"),
+            "connector": ("Parametric Connector", "pan-end-symbolic"),
+            "insert_space": ("Insert Space (Room Cut)", "cut-symbolic"),
         }
 
         title, icon_custom = tool_titles.get(tool, ("Tool Settings", "sliders-symbolic"))
@@ -3300,6 +4329,14 @@ class XNotesViewerWindow(
 
             fill_sw.connect("notify::active", _on_fill_toggled)
             self.tool_settings_box.append(fill_row)
+
+            snap_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            snap_lbl = Gtk.Label(label="Snap Hand-Drawn Shapes", xalign=0.0, hexpand=True)
+            snap_sw = Gtk.Switch(active=bool(getattr(self.canvas, "snap_shapes", False)))
+            snap_row.append(snap_lbl)
+            snap_row.append(snap_sw)
+            snap_sw.connect("notify::active", lambda sw, _: setattr(self.canvas, "snap_shapes", sw.get_active()))
+            self.tool_settings_box.append(snap_row)
 
         elif tool == "pen":
             cur_bw = float(cur_cfg.get("width", self.canvas.pen_width))
@@ -3498,6 +4535,123 @@ class XNotesViewerWindow(
                 edit_btn.connect("clicked", _on_edit_text_clicked)
                 self.tool_settings_box.append(edit_btn)
 
+        elif tool == "neon":
+            cur_bw = float(cur_cfg.get("width", self.canvas.pen_width))
+            self._add_popover_slider(
+                "Glow Tube Size", 1.0, 48.0, 0.5, cur_bw, "{:.1f} px",
+                lambda val: self._on_popover_brush_size_changed("neon", val)
+            )
+
+            cur_str = float(cur_cfg.get("neon_strength", 0.60))
+            self._add_popover_slider(
+                "Neon Bloom Intensity", 0.10, 1.00, 0.05, cur_str, "{:.0f}%",
+                lambda val: cur_cfg.update({"neon_strength": val}),
+                display_transform=lambda v: int(round(v * 100))
+            )
+
+            press_en = bool(cur_cfg.get("pressure_enabled", True))
+            press_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            press_lbl = Gtk.Label(label="Pressure Sensitivity", xalign=0.0, hexpand=True)
+            press_sw = Gtk.Switch(active=press_en)
+            press_row.append(press_lbl)
+            press_row.append(press_sw)
+            press_sw.connect("notify::active", lambda sw, _: cur_cfg.update({"pressure_enabled": sw.get_active()}))
+            self.tool_settings_box.append(press_row)
+
+        elif tool == "tape":
+            cur_w = float(cur_cfg.get("width", 32.0))
+            self._add_popover_slider(
+                "Tape Width", 12.0, 64.0, 2.0, cur_w, "{:.0f} px",
+                lambda val: cur_cfg.update({"width": val})
+            )
+
+            pat_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            pat_lbl = Gtk.Label(label="Tape Pattern", xalign=0.0)
+            pat_box.append(pat_lbl)
+
+            cur_pat = cur_cfg.get("pattern", "stripes")
+            pat_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            pat_row.add_css_class("linked")
+            for p_name in ("stripes", "dots", "grid", "solid"):
+                btn = Gtk.Button(label=p_name.capitalize())
+                if p_name == cur_pat:
+                    btn.add_css_class("suggested-action")
+                def _make_pat_handler(p=p_name):
+                    def _h(_btn):
+                        cur_cfg["pattern"] = p
+                        self._refresh_tool_settings_popover()
+                    return _h
+                btn.connect("clicked", _make_pat_handler())
+                pat_row.append(btn)
+            pat_box.append(pat_row)
+            self.tool_settings_box.append(pat_box)
+
+            act_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            peel_btn = Gtk.Button(label="Peel All Tape")
+            peel_btn.connect("clicked", lambda *_: self._on_peel_all_tape(True))
+            cover_btn = Gtk.Button(label="Cover All Tape")
+            cover_btn.connect("clicked", lambda *_: self._on_peel_all_tape(False))
+            act_box.append(peel_btn)
+            act_box.append(cover_btn)
+            self.tool_settings_box.append(act_box)
+
+        elif tool == "connector":
+            cur_sw = float(cur_cfg.get("stroke_width", 2.5))
+            self._add_popover_slider(
+                "Line Thickness", 1.0, 16.0, 0.5, cur_sw, "{:.1f} px",
+                lambda val: cur_cfg.update({"stroke_width": val})
+            )
+
+            rout_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            rout_lbl = Gtk.Label(label="Routing Path", xalign=0.0)
+            rout_box.append(rout_lbl)
+            cur_rout = cur_cfg.get("routing", "curved")
+            rout_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            rout_row.add_css_class("linked")
+            for r_name in ("curved", "orthogonal", "straight"):
+                btn = Gtk.Button(label=r_name.capitalize())
+                if r_name == cur_rout:
+                    btn.add_css_class("suggested-action")
+                def _make_rout_handler(r=r_name):
+                    def _h(_btn):
+                        cur_cfg["routing"] = r
+                        self._refresh_tool_settings_popover()
+                    return _h
+                btn.connect("clicked", _make_rout_handler())
+                rout_row.append(btn)
+            rout_box.append(rout_row)
+            self.tool_settings_box.append(rout_box)
+
+            dash_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            dash_lbl = Gtk.Label(label="Dashed Line", xalign=0.0, hexpand=True)
+            dash_sw = Gtk.Switch(active=bool(cur_cfg.get("dashed", False)))
+            dash_row.append(dash_lbl)
+            dash_row.append(dash_sw)
+            dash_sw.connect("notify::active", lambda sw, _: cur_cfg.update({"dashed": sw.get_active()}))
+            self.tool_settings_box.append(dash_row)
+
+            neon_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            neon_lbl = Gtk.Label(label="Neon Glow", xalign=0.0, hexpand=True)
+            neon_sw = Gtk.Switch(active=bool(cur_cfg.get("neon", False)))
+            neon_row.append(neon_lbl)
+            neon_row.append(neon_sw)
+            neon_sw.connect("notify::active", lambda sw, _: cur_cfg.update({"neon": sw.get_active()}))
+            self.tool_settings_box.append(neon_row)
+
+        elif tool == "insert_space":
+            cur_gap = float(cur_cfg.get("gap", 100.0))
+            self._add_popover_slider(
+                "Default Room", 20.0, 500.0, 10.0, cur_gap, "{:.0f} px",
+                lambda val: cur_cfg.update({"gap": val})
+            )
+            desc_lbl = Gtk.Label(
+                label="Drag vertically downwards on the page with stylus or mouse to open up space and push down lower notes.",
+                wrap=True, xalign=0.0
+            )
+            desc_lbl.add_css_class("caption")
+            desc_lbl.add_css_class("dim-label")
+            self.tool_settings_box.append(desc_lbl)
+
     def _add_popover_slider(self, label_text, min_val, max_val, step, cur_val, fmt, on_change, display_transform=None):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -3628,25 +4782,58 @@ class XNotesViewerWindow(
         if self.canvas.view_mode == "scrolled":
             GLib.idle_add(self.scroll_to_page, self.canvas.current_page)
 
-    def on_save_clicked(self, *args):
+    def _update_autosave_timer(self):
+        if getattr(self, "_autosave_timer_id", None) is not None:
+            try:
+                GLib.source_remove(self._autosave_timer_id)
+            except Exception:
+                pass
+            self._autosave_timer_id = None
+
+        if getattr(self, "autosave_enabled", True):
+            interval_sec = max(5, int(getattr(self, "autosave_interval", 30)))
+            self._autosave_timer_id = GLib.timeout_add_seconds(interval_sec, self._on_autosave_tick)
+
+    def _on_autosave_tick(self):
+        if (
+            getattr(self, "autosave_enabled", True)
+            and getattr(self, "is_modified", False)
+            and getattr(self, "current_file_path", None)
+            and hasattr(self, "root_stack")
+            and self.root_stack.get_visible_child_name() == "viewer"
+        ):
+            self.save_document(silent=True)
+        return True
+
+    def save_document(self, silent=False):
         if not self.current_file_path:
             return False
 
         if self.current_file_type == "md":
             try:
+                if hasattr(self, "md_buffer") and self.md_buffer and self.md_buffer.get_char_count() > 0:
+                    start, end = self.md_buffer.get_bounds()
+                    self.markdown_content = self.md_buffer.get_text(start, end, False)
+
                 with open(self.current_file_path, "w", encoding="utf-8") as f:
                     f.write(self.markdown_content)
                 self._on_canvas_modified(False)
-                self.show_toast(f"Saved {os.path.basename(self.current_file_path)}")
-                if self.current_root_folder:
-                    self.load_folder(self.current_root_folder)
+                if not silent:
+                    self.show_toast(f"Saved {os.path.basename(self.current_file_path)}")
+                    if self.current_root_folder:
+                        self.load_folder(self.current_root_folder)
+                self._maybe_auto_sync_nextcloud()
                 return True
             except Exception as e:
-                self.show_error(f"Failed to save Markdown file: {e}")
+                if not silent:
+                    self.show_error(f"Failed to save Markdown file: {e}")
+                else:
+                    print(f"Autosave failed for Markdown: {e}")
                 return False
 
         if not self.canvas.document or self.current_file_type not in ("xnote", "xcanvas"):
-            self.show_error("Only .xnote, .xcanvas, and .md files can be saved directly.")
+            if not silent:
+                self.show_error("Only .xnote, .xcanvas, and .md files can be saved directly.")
             return False
 
         try:
@@ -3656,13 +4843,21 @@ class XNotesViewerWindow(
                 templates=self.canvas.templates
             )
             self._on_canvas_modified(False)
-            self.show_toast(f"Saved {os.path.basename(self.current_file_path)}")
-            if self.current_root_folder:
-                self.load_folder(self.current_root_folder)
+            if not silent:
+                self.show_toast(f"Saved {os.path.basename(self.current_file_path)}")
+                if self.current_root_folder:
+                    self.load_folder(self.current_root_folder)
+            self._maybe_auto_sync_nextcloud()
             return True
         except Exception as e:
-            self.show_error(f"Failed to save archive: {e}")
+            if not silent:
+                self.show_error(f"Failed to save archive: {e}")
+            else:
+                print(f"Autosave failed for archive: {e}")
             return False
+
+    def on_save_clicked(self, *args):
+        return self.save_document(silent=False)
 
     def on_save_as_clicked(self, *args):
         if hasattr(Gtk, "FileDialog"):
@@ -3847,6 +5042,20 @@ class XNotesViewerWindow(
             data["library_sort_mode"] = self.library_sort_mode
             data["show_markdown_files"] = getattr(self, "show_markdown_files", True)
             data["theme"] = getattr(self, "theme_mode", "system")
+            data["md_theme"] = getattr(self, "md_theme_id", "auto")
+            data["md_markup_visibility"] = getattr(self, "md_markup_visibility", "focus")
+            data["md_focus_mode"] = bool(getattr(self, "md_focus_mode", False))
+            data["md_typewriter_mode"] = bool(getattr(self, "md_typewriter_mode", False))
+            data["recent_colors"] = getattr(self, "recent_colors", ["#d54425", "#1a6ed8", "#1e1e1e"])
+            data["autosave_enabled"] = bool(getattr(self, "autosave_enabled", True))
+            data["autosave_interval"] = int(getattr(self, "autosave_interval", 30))
+            data["pen_rgba"] = getattr(self.canvas, "pen_rgba", [213, 68, 37, 255])
+            data["md_font_family"] = getattr(self, "md_font_family", "sans")
+            data["nextcloud_enabled"] = bool(getattr(self, "nextcloud_enabled", False))
+            data["nextcloud_server_url"] = getattr(self, "nextcloud_server_url", "")
+            data["nextcloud_username"] = getattr(self, "nextcloud_username", "")
+            data["nextcloud_app_password"] = getattr(self, "nextcloud_app_password", "")
+            data["nextcloud_auto_sync"] = bool(getattr(self, "nextcloud_auto_sync", True))
             with open(config_path, "w") as f:
                 json.dump(data, f)
         except Exception as e:
@@ -3885,8 +5094,28 @@ class XNotesViewerWindow(
                     if hasattr(self, "show_markdown_action"):
                         self.show_markdown_action.set_state(GLib.Variant.new_boolean(self.show_markdown_files))
 
-                    saved_theme = data.get("theme", "system")
-                    self.set_theme_mode(saved_theme)
+                    saved_scheme = data.get("md_theme", data.get("theme", "auto"))
+                    self.md_theme_id = saved_scheme
+                    self.theme_mode = saved_scheme
+                    self.md_markup_visibility = "dim"
+                    self.md_focus_mode = bool(data.get("md_focus_mode", False))
+                    self.md_typewriter_mode = bool(data.get("md_typewriter_mode", False))
+                    self.recent_colors = data.get("recent_colors", ["#d54425", "#1a6ed8", "#1e1e1e"])
+                    self.autosave_enabled = bool(data.get("autosave_enabled", True))
+                    self.autosave_interval = int(data.get("autosave_interval", 30))
+                    self._update_autosave_timer()
+                    if "pen_rgba" in data and isinstance(data["pen_rgba"], list) and len(data["pen_rgba"]) == 4:
+                        self.canvas.pen_rgba = list(data["pen_rgba"])
+                    self._update_color_palette_ui()
+                    self.md_font_family = data.get("md_font_family", "sans")
+                    self._apply_application_color_scheme(saved_scheme)
+                    self._apply_md_scribe_settings(save=False)
+
+                    self.nextcloud_enabled = bool(data.get("nextcloud_enabled", False))
+                    self.nextcloud_server_url = data.get("nextcloud_server_url", "")
+                    self.nextcloud_username = data.get("nextcloud_username", "")
+                    self.nextcloud_app_password = data.get("nextcloud_app_password", "")
+                    self.nextcloud_auto_sync = bool(data.get("nextcloud_auto_sync", True))
 
                     last_folder = data.get("last_folder")
                     if last_folder and os.path.isdir(last_folder):
@@ -3926,8 +5155,15 @@ class XNotesViewerWindow(
             ("toggle-view-mode", self.on_toggle_view_mode_action),
             ("toggle-zoom-lock", self.on_toggle_zoom_lock_action),
             ("toggle-double-page", self.on_toggle_double_page_action),
+            ("pdf-filter-normal", lambda *_: self._set_pdf_filter("normal")),
+            ("pdf-filter-invert", lambda *_: self._set_pdf_filter("invert")),
+            ("pdf-filter-sepia", lambda *_: self._set_pdf_filter("sepia")),
+            ("pdf-filter-oled", lambda *_: self._set_pdf_filter("oled")),
+            ("peel-all-tape", lambda *_: self._on_peel_all_tape(True)),
+            ("cover-all-tape", lambda *_: self._on_peel_all_tape(False)),
             ("record-audio", lambda *_: self._on_record_audio_clicked(None)),
             ("attach-audio", lambda *_: self._on_attach_audio_clicked(None)),
+            ("sync-nextcloud", self.on_sync_nextcloud_clicked),
             ("back", self.on_back_clicked),
             ("find", self.on_find_shortcut),
             ("preferences", self.show_preferences_dialog),
@@ -3956,6 +5192,36 @@ class XNotesViewerWindow(
         self.show_markdown_action.connect("activate", self._on_show_markdown_activate)
         self.add_action(self.show_markdown_action)
 
+    def _set_pdf_filter(self, filter_name):
+        if not hasattr(self, "canvas") or not self.canvas.document:
+            return
+        self.canvas.document["pdf_filter"] = filter_name
+        self.canvas.invalidate_all_pages()
+        self.canvas.queue_draw()
+        if self.canvas.on_modified_cb:
+            self.canvas.on_modified_cb(True)
+
+    def _on_peel_all_tape(self, peel=True):
+        if not hasattr(self, "canvas") or not self.canvas.document:
+            return
+        modified = False
+        for page_idx, page in enumerate(self.canvas.document.get("pages", [])):
+            old_items = self.canvas._clone_items_list(page.get("items", []))
+            page_modified = False
+            for it in page.get("items", []):
+                if it.get("kind") == "tape" and bool(it.get("peeled", False)) != peel:
+                    it["peeled"] = peel
+                    page_modified = True
+                    modified = True
+            if page_modified:
+                new_items = self.canvas._clone_items_list(page.get("items", []))
+                self.canvas._record_undo_step(page_idx, old_items, new_items, clone=False)
+        if modified:
+            self.canvas.invalidate_all_pages()
+            self.canvas.queue_draw()
+            if self.canvas.on_modified_cb:
+                self.canvas.on_modified_cb(True)
+
     def _on_show_markdown_change_state(self, action, value):
         action.set_state(value)
         self.show_markdown_files = value.get_boolean()
@@ -3966,30 +5232,190 @@ class XNotesViewerWindow(
         current = action.get_state().get_boolean()
         action.change_state(GLib.Variant.new_boolean(not current))
 
+    def _on_md_focus_mode_toggled(self, btn):
+        self.md_focus_mode = bool(btn.get_active())
+        self._apply_md_scribe_settings(save=True)
+
+    def _on_minimap_toggled(self, btn):
+        show = btn.get_active()
+        if hasattr(self, "canvas") and self.canvas:
+            self.canvas.show_minimap = show
+            self.canvas.queue_draw()
+
+    def _apply_md_scribe_settings(self, save=True):
+        if hasattr(self, "md_focus_btn") and self.md_focus_btn.get_active() != self.md_focus_mode:
+            self.md_focus_btn.set_active(self.md_focus_mode)
+        if hasattr(self, "md_typewriter_btn") and self.md_typewriter_btn.get_active() != self.md_typewriter_mode:
+            self.md_typewriter_btn.set_active(self.md_typewriter_mode)
+        if hasattr(self, "md_inline_styler") and self.md_inline_styler:
+            styler = self.md_inline_styler
+            styler.theme_id = self.md_theme_id
+            styler.font_family = self.md_font_family
+            styler.focus_mode = self.md_focus_mode
+            styler.typewriter_mode = self.md_typewriter_mode
+            styler.set_markup_visibility("dim")
+            styler.apply_theme()
+        if hasattr(self, "md_paper_box") and self.md_paper_box and getattr(self, "current_file_type", None) == "md":
+            theme = self.md_inline_styler.current_theme if hasattr(self, "md_inline_styler") else None
+            MarkdownRenderer.populate_box(
+                self.md_paper_box,
+                getattr(self, "markdown_content", ""),
+                getattr(self.canvas, "zoom_level", 1.0),
+                theme=theme,
+            )
+        if save:
+            self.save_config()
+
+    def _build_md_scribe_popover(self):
+        pop = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+        box.set_margin_start(14)
+        box.set_margin_end(14)
+
+        lbl_font = Gtk.Label(label="Typography", xalign=0.0)
+        lbl_font.add_css_class("heading")
+        box.append(lbl_font)
+
+        font_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        font_box.add_css_class("linked")
+        self._md_font_btns = {}
+        first_f = None
+        for fmode, flabel in [("sans", "Sans"), ("serif", "Serif"), ("mono", "Mono")]:
+            fb = Gtk.ToggleButton(label=flabel, hexpand=True)
+            if first_f is not None:
+                fb.set_group(first_f)
+            else:
+                first_f = fb
+            if fmode == self.md_font_family:
+                fb.set_active(True)
+            fb.connect("toggled", self._on_md_font_toggled, fmode)
+            font_box.append(fb)
+            self._md_font_btns[fmode] = fb
+        box.append(font_box)
+
+        pop.set_child(box)
+        return pop
+
+    def _on_md_font_toggled(self, btn, fmode):
+        if btn.get_active() and self.md_font_family != fmode:
+            self.md_font_family = fmode
+            self._apply_md_scribe_settings(save=True)
+
+    def _on_md_typewriter_toggled(self, btn):
+        self.md_typewriter_mode = bool(btn.get_active())
+        if hasattr(self, "md_typewriter_btn") and self.md_typewriter_btn.get_active() != self.md_typewriter_mode:
+            self.md_typewriter_btn.set_active(self.md_typewriter_mode)
+        self._apply_md_scribe_settings(save=True)
+
     def _on_style_dark_changed(self, is_dark):
         if hasattr(self, "md_inline_styler") and self.md_inline_styler:
             self.md_inline_styler.update_theme_colors(is_dark)
         if hasattr(self, "md_paper_box") and self.md_paper_box and getattr(self, "current_file_type", None) == "md":
+            theme = self.md_inline_styler.current_theme if hasattr(self, "md_inline_styler") else None
             MarkdownRenderer.populate_box(
-                self.md_paper_box, getattr(self, "markdown_content", ""), getattr(self.canvas, "zoom_level", 1.0)
+                self.md_paper_box,
+                getattr(self, "markdown_content", ""),
+                getattr(self.canvas, "zoom_level", 1.0),
+                theme=theme,
             )
 
-    def set_theme_mode(self, mode):
-        self.theme_mode = mode
+    def _apply_application_color_scheme(self, scheme_id):
+        self.md_theme_id = scheme_id
+        self.theme_mode = scheme_id
         sm = Adw.StyleManager.get_default()
-        if mode == "light":
+
+        if scheme_id == "light":
             sm.set_color_scheme(Adw.ColorScheme.FORCE_LIGHT)
-        elif mode == "dark":
+        elif scheme_id in ("dark", "solarized-dark", "gruvbox-dark"):
             sm.set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        elif scheme_id == "sepia":
+            sm.set_color_scheme(Adw.ColorScheme.FORCE_LIGHT)
         else:
             sm.set_color_scheme(Adw.ColorScheme.DEFAULT)
+
+        if not hasattr(self, "_theme_css_provider"):
+            self._theme_css_provider = Gtk.CssProvider()
+            disp = Gdk.Display.get_default()
+            if disp:
+                Gtk.StyleContext.add_provider_for_display(
+                    disp,
+                    self._theme_css_provider,
+                    Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 10
+                )
+
+        if scheme_id == "sepia":
+            css = """
+                @define-color window_bg_color #f5efe0;
+                @define-color window_fg_color #43392a;
+                @define-color view_bg_color #f5efe0;
+                @define-color view_fg_color #43392a;
+                @define-color headerbar_bg_color #ebe4d3;
+                @define-color headerbar_fg_color #43392a;
+                @define-color sidebar_bg_color #ede6d5;
+                @define-color sidebar_fg_color #43392a;
+                @define-color card_bg_color #ede6d5;
+                @define-color card_fg_color #43392a;
+                @define-color accent_color #8a5a2b;
+                @define-color accent_bg_color #8a5a2b;
+                @define-color borders #c9bb9d;
+            """
+            self._theme_css_provider.load_from_data(css.encode('utf-8'))
+        elif scheme_id == "solarized-dark":
+            css = """
+                @define-color window_bg_color #002b36;
+                @define-color window_fg_color #839496;
+                @define-color view_bg_color #002b36;
+                @define-color view_fg_color #839496;
+                @define-color headerbar_bg_color #073642;
+                @define-color headerbar_fg_color #93a1a1;
+                @define-color sidebar_bg_color #073642;
+                @define-color sidebar_fg_color #839496;
+                @define-color card_bg_color #073642;
+                @define-color card_fg_color #93a1a1;
+                @define-color accent_color #268bd2;
+                @define-color accent_bg_color #268bd2;
+                @define-color borders #586e75;
+            """
+            self._theme_css_provider.load_from_data(css.encode('utf-8'))
+        elif scheme_id == "gruvbox-dark":
+            css = """
+                @define-color window_bg_color #282828;
+                @define-color window_fg_color #ebdbb2;
+                @define-color view_bg_color #282828;
+                @define-color view_fg_color #ebdbb2;
+                @define-color headerbar_bg_color #32302f;
+                @define-color headerbar_fg_color #fbf1c7;
+                @define-color sidebar_bg_color #32302f;
+                @define-color sidebar_fg_color #ebdbb2;
+                @define-color card_bg_color #32302f;
+                @define-color card_fg_color #ebdbb2;
+                @define-color accent_color #83a598;
+                @define-color accent_bg_color #83a598;
+                @define-color borders #504945;
+            """
+            self._theme_css_provider.load_from_data(css.encode('utf-8'))
+        else:
+            self._theme_css_provider.load_from_data(b"")
+
         if hasattr(self, "md_inline_styler") and self.md_inline_styler:
+            self.md_inline_styler.theme_id = scheme_id
             self.md_inline_styler.update_theme_colors(sm.get_dark())
+            self.md_inline_styler.apply_theme()
+
         if hasattr(self, "md_paper_box") and self.md_paper_box and getattr(self, "current_file_type", None) == "md":
+            theme = self.md_inline_styler.current_theme if hasattr(self, "md_inline_styler") else None
             MarkdownRenderer.populate_box(
-                self.md_paper_box, getattr(self, "markdown_content", ""), getattr(self.canvas, "zoom_level", 1.0)
+                self.md_paper_box,
+                getattr(self, "markdown_content", ""),
+                getattr(self.canvas, "zoom_level", 1.0),
+                theme=theme,
             )
         self.save_config()
+
+    def set_theme_mode(self, mode):
+        self._apply_application_color_scheme(mode)
 
     def show_preferences_dialog(self, *args):
         dlg = Adw.PreferencesDialog()
@@ -4002,34 +5428,128 @@ class XNotesViewerWindow(
         # Appearance Group
         grp_theme = Adw.PreferencesGroup()
         grp_theme.set_title("Appearance")
-        grp_theme.set_description("Select theme for the user interface and text notes.")
+        grp_theme.set_description("Select color scheme for the application and text notes.")
 
+        scheme_opts = [
+            ("auto", "Automatic (Follow System)"),
+            ("light", "Light"),
+            ("dark", "Dark"),
+            ("sepia", "Sepia"),
+            ("solarized-dark", "Solarized Dark"),
+            ("gruvbox-dark", "Gruvbox Dark"),
+        ]
         theme_row = Adw.ComboRow()
-        theme_row.set_title("Theme")
-        theme_row.set_subtitle("Notebook pages always retain their original paper color.")
-        theme_model = Gtk.StringList.new(["Follow System", "Light", "Dark"])
+        theme_row.set_title("Application Color Scheme")
+        theme_row.set_subtitle("Applies across the entire application interface and text notes")
+        theme_model = Gtk.StringList.new([lbl for _, lbl in scheme_opts])
         theme_row.set_model(theme_model)
 
-        cur_theme = getattr(self, "theme_mode", "system")
-        if cur_theme == "light":
-            theme_row.set_selected(1)
-        elif cur_theme == "dark":
-            theme_row.set_selected(2)
-        else:
-            theme_row.set_selected(0)
+        cur_scheme = getattr(self, "md_theme_id", "auto")
+        theme_row.set_selected(next((i for i, (tid, _) in enumerate(scheme_opts) if tid == cur_scheme), 0))
 
         def _on_theme_row_selected(row, _param):
             idx = row.get_selected()
-            if idx == 1:
-                self.set_theme_mode("light")
-            elif idx == 2:
-                self.set_theme_mode("dark")
-            else:
-                self.set_theme_mode("system")
+            if 0 <= idx < len(scheme_opts):
+                chosen_id = scheme_opts[idx][0]
+                self._apply_application_color_scheme(chosen_id)
 
         theme_row.connect("notify::selected", _on_theme_row_selected)
         grp_theme.add(theme_row)
         page.add(grp_theme)
+
+        # Autosave Group
+        grp_autosave = Adw.PreferencesGroup()
+        grp_autosave.set_title("Autosave")
+        grp_autosave.set_description("Automatically save notebooks and notes as you write.")
+
+        autosave_row = Adw.SwitchRow()
+        autosave_row.set_title("Autosave")
+        autosave_row.set_subtitle("Automatically save changes to open notebooks and notes")
+        autosave_row.set_active(bool(getattr(self, "autosave_enabled", True)))
+
+        interval_opts = [
+            (10, "10 seconds"),
+            (30, "30 seconds (Default)"),
+            (60, "1 minute"),
+            (120, "2 minutes"),
+            (300, "5 minutes"),
+        ]
+        interval_row = Adw.ComboRow()
+        interval_row.set_title("Autosave Interval")
+        interval_row.set_subtitle("Frequency of automatic saving when changes are made")
+        interval_row.set_model(Gtk.StringList.new([lbl for _, lbl in interval_opts]))
+        cur_interval = getattr(self, "autosave_interval", 30)
+        interval_row.set_selected(next((i for i, (sec, _) in enumerate(interval_opts) if sec == cur_interval), 1))
+        interval_row.set_sensitive(autosave_row.get_active())
+
+        def _on_autosave_row_active(row, _param):
+            self.autosave_enabled = bool(row.get_active())
+            interval_row.set_sensitive(self.autosave_enabled)
+            self._update_autosave_timer()
+            self.save_config()
+
+        def _on_interval_row_selected(row, _param):
+            idx = row.get_selected()
+            if 0 <= idx < len(interval_opts):
+                self.autosave_interval = interval_opts[idx][0]
+                self._update_autosave_timer()
+                self.save_config()
+
+        autosave_row.connect("notify::active", _on_autosave_row_active)
+        interval_row.connect("notify::selected", _on_interval_row_selected)
+        grp_autosave.add(autosave_row)
+        grp_autosave.add(interval_row)
+        page.add(grp_autosave)
+
+        # Markdown Editor Group
+        grp_md_editor = Adw.PreferencesGroup()
+        grp_md_editor.set_title("Markdown Editor")
+        grp_md_editor.set_description("Configure editor typography and writing focus.")
+
+        font_opts = [("sans", "Sans (Cantarell)"), ("serif", "Serif"), ("mono", "Monospace")]
+        font_row = Adw.ComboRow()
+        font_row.set_title("Editor Font Family")
+        font_row.set_subtitle("Code and tables always use a monospaced font")
+        font_row.set_model(Gtk.StringList.new([lbl for _, lbl in font_opts]))
+        font_row.set_selected(next((i for i, (k, _) in enumerate(font_opts) if k == self.md_font_family), 0))
+
+        def _on_font_row_selected(row, _param):
+            idx = row.get_selected()
+            if 0 <= idx < len(font_opts):
+                self.md_font_family = font_opts[idx][0]
+                if hasattr(self, "_md_font_btns") and self.md_font_family in self._md_font_btns:
+                    self._md_font_btns[self.md_font_family].set_active(True)
+                self._apply_md_scribe_settings(save=True)
+
+        font_row.connect("notify::selected", _on_font_row_selected)
+        grp_md_editor.add(font_row)
+
+        focus_row = Adw.SwitchRow()
+        focus_row.set_title("Focus Mode")
+        focus_row.set_subtitle("Dim all text outside the currently active paragraph")
+        focus_row.set_active(self.md_focus_mode)
+
+        def _on_focus_row_active(row, _param):
+            self.md_focus_mode = bool(row.get_active())
+            self._apply_md_scribe_settings(save=True)
+
+        focus_row.connect("notify::active", _on_focus_row_active)
+        grp_md_editor.add(focus_row)
+
+        tw_row = Adw.SwitchRow()
+        tw_row.set_title("Typewriter Scrolling")
+        tw_row.set_subtitle("Keep the active line vertically centered while writing")
+        tw_row.set_active(self.md_typewriter_mode)
+
+        def _on_tw_row_active(row, _param):
+            self.md_typewriter_mode = bool(row.get_active())
+            if hasattr(self, "md_typewriter_btn"):
+                self.md_typewriter_btn.set_active(self.md_typewriter_mode)
+            self._apply_md_scribe_settings(save=True)
+
+        tw_row.connect("notify::active", _on_tw_row_active)
+        grp_md_editor.add(tw_row)
+        page.add(grp_md_editor)
 
         # Library Group
         grp_lib = Adw.PreferencesGroup()
@@ -4095,8 +5615,181 @@ class XNotesViewerWindow(
         grp_dir.add(dir_row)
         page.add(grp_dir)
 
+        # Nextcloud Sync Group (/Notebooks folder)
+        grp_nc = Adw.PreferencesGroup()
+        grp_nc.set_title("Nextcloud Sync (Notebooks)")
+        grp_nc.set_description("Two-way WebDAV sync of the entire notebook directory (including subfolders and hidden files) to the /Notebooks folder on your Nextcloud server.")
+
+        nc_enable_row = Adw.SwitchRow()
+        nc_enable_row.set_title("Enable Nextcloud Sync")
+        nc_enable_row.set_subtitle("Two-way WebDAV sync with /remote.php/dav/files/[username]/Notebooks/")
+        nc_enable_row.set_active(bool(getattr(self, "nextcloud_enabled", False)))
+
+        nc_url_row = Adw.EntryRow()
+        nc_url_row.set_title("Nextcloud Server URL (e.g. https://cloud.example.com)")
+        nc_url_row.set_text(getattr(self, "nextcloud_server_url", "") or "")
+
+        nc_user_row = Adw.EntryRow()
+        nc_user_row.set_title("Username")
+        nc_user_row.set_text(getattr(self, "nextcloud_username", "") or "")
+
+        nc_pass_row = Adw.PasswordEntryRow()
+        nc_pass_row.set_title("App Password")
+        nc_pass_row.set_text(getattr(self, "nextcloud_app_password", "") or "")
+
+        nc_auto_row = Adw.SwitchRow()
+        nc_auto_row.set_title("Auto-sync on Save")
+        nc_auto_row.set_subtitle("Automatically synchronize with Nextcloud when saving a document")
+        nc_auto_row.set_active(bool(getattr(self, "nextcloud_auto_sync", True)))
+
+        nc_action_row = Adw.ActionRow()
+        nc_action_row.set_title("Nextcloud Connection and Sync")
+        nc_action_row.set_subtitle("Target folder: /Notebooks")
+
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6, valign=Gtk.Align.CENTER)
+        test_nc_btn = Gtk.Button(label="Test Connection")
+        sync_nc_btn = Gtk.Button(label="Sync Now")
+        sync_nc_btn.add_css_class("suggested-action")
+        btn_box.append(test_nc_btn)
+        btn_box.append(sync_nc_btn)
+        nc_action_row.add_suffix(btn_box)
+
+        def _save_nc_fields(*_):
+            self.nextcloud_enabled = bool(nc_enable_row.get_active())
+            self.nextcloud_server_url = nc_url_row.get_text().strip()
+            self.nextcloud_username = nc_user_row.get_text().strip()
+            self.nextcloud_app_password = nc_pass_row.get_text()
+            self.nextcloud_auto_sync = bool(nc_auto_row.get_active())
+            self.save_config()
+
+        nc_enable_row.connect("notify::active", _save_nc_fields)
+        nc_url_row.connect("changed", _save_nc_fields)
+        nc_user_row.connect("changed", _save_nc_fields)
+        nc_pass_row.connect("changed", _save_nc_fields)
+        nc_auto_row.connect("notify::active", _save_nc_fields)
+
+        def _on_test_nc_clicked(_btn):
+            _save_nc_fields()
+            test_nc_btn.set_sensitive(False)
+            nc_action_row.set_subtitle("Testing connection to Nextcloud /Notebooks…")
+
+            def _bg():
+                client = NextcloudSyncClient(
+                    self.nextcloud_server_url,
+                    self.nextcloud_username,
+                    self.nextcloud_app_password,
+                )
+                return client.ensure_notebooks_folder()
+
+            def _done(fut):
+                try:
+                    ok, msg = fut.result()
+                except Exception as exc:
+                    ok, msg = False, str(exc)
+
+                def _ui():
+                    test_nc_btn.set_sensitive(True)
+                    nc_action_row.set_subtitle(msg)
+                    self.show_toast(msg)
+                    return False
+
+                GLib.idle_add(_ui)
+
+            fut = self.executor.submit(_bg)
+            fut.add_done_callback(_done)
+
+        def _on_sync_nc_clicked(_btn):
+            _save_nc_fields()
+            sync_nc_btn.set_sensitive(False)
+            nc_action_row.set_subtitle("Syncing with Nextcloud /Notebooks…")
+            self._run_nextcloud_sync(
+                on_complete=lambda ok, msg: (
+                    sync_nc_btn.set_sensitive(True),
+                    nc_action_row.set_subtitle(msg),
+                )
+            )
+
+        test_nc_btn.connect("clicked", _on_test_nc_clicked)
+        sync_nc_btn.connect("clicked", _on_sync_nc_clicked)
+
+        grp_nc.add(nc_enable_row)
+        grp_nc.add(nc_url_row)
+        grp_nc.add(nc_user_row)
+        grp_nc.add(nc_pass_row)
+        grp_nc.add(nc_auto_row)
+        grp_nc.add(nc_action_row)
+        page.add(grp_nc)
+
         dlg.add(page)
         dlg.present(self)
+
+    def _maybe_auto_sync_nextcloud(self):
+        if getattr(self, "nextcloud_enabled", False) and getattr(self, "nextcloud_auto_sync", True):
+            self._run_nextcloud_sync(silent=True)
+
+    def on_sync_nextcloud_clicked(self, *args):
+        if not getattr(self, "nextcloud_enabled", False):
+            self.show_toast("Enable Nextcloud Sync in Preferences first.")
+            self.show_preferences_dialog()
+            return
+        self._run_nextcloud_sync(silent=False)
+
+    def _run_nextcloud_sync(self, silent=False, on_complete=None):
+        if getattr(self, "_nc_sync_in_progress", False):
+            if not silent:
+                self.show_toast("Nextcloud sync is already in progress.")
+            return
+
+        target_dir = self.current_root_folder or os.path.expanduser("~/Notebooks")
+        os.makedirs(target_dir, exist_ok=True)
+        self._nc_sync_in_progress = True
+        if not silent:
+            self.show_toast("Syncing with Nextcloud /Notebooks…")
+
+        server_url = getattr(self, "nextcloud_server_url", "")
+        username = getattr(self, "nextcloud_username", "")
+        app_password = getattr(self, "nextcloud_app_password", "")
+
+        def _bg():
+            client = NextcloudSyncClient(server_url, username, app_password)
+            return client.sync_folder(target_dir)
+
+        def _done(fut):
+            try:
+                res = fut.result()
+                if hasattr(res, "success") and hasattr(res, "message") and hasattr(res, "downloaded"):
+                    ok = bool(res.success)
+                    msg = str(res.message)
+                    down_cnt = int(res.downloaded)
+                elif isinstance(res, (tuple, list)):
+                    if len(res) >= 4:
+                        ok, _, down_cnt, msg = res[0], res[1], res[2], res[3]
+                    elif len(res) == 3:
+                        ok, msg, down_cnt = res[0], res[1], res[2]
+                    elif len(res) == 2:
+                        ok, msg = res[0], res[1]
+                        down_cnt = 0
+                    else:
+                        ok, msg, down_cnt = bool(res[0]), str(res[-1]), 0
+                else:
+                    ok, msg, down_cnt = False, str(res), 0
+            except Exception as exc:
+                ok, msg, down_cnt = False, f"Nextcloud sync error: {exc}", 0
+
+            def _ui():
+                self._nc_sync_in_progress = False
+                if down_cnt > 0 and self.current_root_folder:
+                    self.load_folder(self.current_root_folder)
+                if not silent or not ok:
+                    self.show_toast(msg)
+                if on_complete:
+                    on_complete(ok, msg)
+                return False
+
+            GLib.idle_add(_ui)
+
+        fut = self.executor.submit(_bg)
+        fut.add_done_callback(_done)
 
     def show_shortcuts_dialog(self, *args):
         categories = [
@@ -4416,25 +6109,34 @@ class XNotesViewerWindow(
             self.md_buffer.end_irreversible_action()
             self._loading_md_buffer = False
             self.md_inline_styler.refresh()
+            if getattr(self, "md_typewriter_mode", False):
+                GLib.idle_add(self.md_inline_styler._center_cursor_line)
 
             self._on_canvas_modified(False)
             self._sync_md_undo_redo_buttons()
 
-            MarkdownRenderer.populate_box(
-                self.md_paper_box, self.markdown_content, self.canvas.zoom_level
-            )
+            self._refresh_md_preview()
 
             self.md_edit_btn.set_active(True)
+            self.md_view_mode = "edit"
             self._apply_md_preview_layout_style("edit")
             self.md_edit_scrolled.set_visible(True)
             self.md_scrolled.set_visible(False)
-            win_w = self.get_width() or 1200
-            self.md_paned.set_position(win_w)
 
             self.window_title.set_title(os.path.splitext(os.path.basename(path))[0])
             self.window_title.set_subtitle("")
             self.viewer_stack.set_visible_child_name("markdown_doc")
-            self.page_sidebar_btn.set_visible(False)
+            self.page_sidebar_btn.set_visible(True)
+            self.page_sidebar_btn.set_tooltip_text("Toggle Document Outline Sidebar (F9)")
+            if hasattr(self, "minimap_btn"):
+                self.minimap_btn.set_visible(False)
+            is_sb_open = False
+            if hasattr(self, "md_split_view"):
+                is_sb_open = self.md_split_view.get_show_sidebar()
+            elif hasattr(self, "md_sidebar_revealer"):
+                is_sb_open = self.md_sidebar_revealer.get_reveal_child()
+            self.page_sidebar_btn.set_active(is_sb_open)
+            self._rebuild_markdown_outline()
             if hasattr(self, "md_mode_box"):
                 self.md_mode_box.set_visible(True)
             self.mode_box.set_visible(False)
@@ -4503,8 +6205,12 @@ class XNotesViewerWindow(
             is_editable = self.current_file_type in ("xnote", "xcanvas")
 
             self.page_sidebar_btn.set_visible(is_editable and not is_canvas)
+            self.page_sidebar_btn.set_tooltip_text("Toggle Page Sidebar (F9)")
             self.page_sidebar_btn.set_active(False)
             self.page_sidebar_revealer.set_reveal_child(False)
+            if hasattr(self, "minimap_btn"):
+                self.minimap_btn.set_visible(is_canvas)
+                self.minimap_btn.set_active(getattr(self.canvas, "show_minimap", True))
 
             if hasattr(self, "md_mode_box"):
                 self.md_mode_box.set_visible(False)
@@ -4727,9 +6433,7 @@ class XNotesViewerWindow(
             elif self.current_file_type == "md":
                 if self.md_view_mode == "preview":
                     self.md_paper_box.set_size_request(int(680 * self.canvas.zoom_level), -1)
-                MarkdownRenderer.populate_box(
-                    self.md_paper_box, self.markdown_content, self.canvas.zoom_level
-                )
+                self._refresh_md_preview()
             elif self.canvas.document:
                 self.canvas.page_cache.clear()
                 self.canvas.bg_cache.clear()
@@ -4838,9 +6542,12 @@ class XNotesViewerWindow(
                 elif self.canvas.view_mode == "scrolled":
                     self.scroll_to_page(self.canvas.current_page)
 
-    def show_toast(self, message, timeout=3):
+    def show_toast(self, message, timeout=3, button_label=None, on_button_clicked=None):
         toast = Adw.Toast.new(message)
         toast.set_timeout(timeout)
+        if button_label and on_button_clicked:
+            toast.set_button_label(button_label)
+            toast.connect("button-clicked", lambda *_: on_button_clicked())
         self.toast_overlay.add_toast(toast)
 
     def show_error(self, message):
@@ -4852,8 +6559,8 @@ class XNotesViewerWindow(
     def _on_zoom_lock_toggled(self, btn):
         locked = btn.get_active()
         self.canvas.zoom_locked = locked
-        lock_icon = self._resolve_icon_name("lock-symbolic")
-        unlock_icon = self._resolve_icon_name("unlock-symbolic")
+        lock_icon = self._resolve_icon_name("changes-prevent-symbolic")
+        unlock_icon = self._resolve_icon_name("changes-allow-symbolic")
         btn.set_icon_name(lock_icon if locked else unlock_icon)
         btn.set_tooltip_text("Unlock Zoom (Ctrl+L)" if locked else "Lock Zoom (Ctrl+L)")
         self.zoom_in_btn.set_sensitive(not locked)

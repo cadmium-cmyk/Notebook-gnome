@@ -34,6 +34,7 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
         self.set_halign(Gtk.Align.CENTER)
         self.set_valign(Gtk.Align.CENTER)
         self.set_focusable(True)
+        self.set_cursor_from_name("none")
         self.set_draw_func(self.on_draw)
 
         self.on_modified_cb = on_modified_cb
@@ -69,6 +70,7 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
         self._active_text_box = None
         self._sized_text_box = None
         self._minimap_surface_cache = None
+        self.show_minimap = True
         self.nib_angle_rad = -math.radians(35.0)
 
         # Shapes tool settings
@@ -121,7 +123,39 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
             "eraser": {
                 "radius": 16.0,
             },
+            "neon": {
+                "width": 9.3,
+                "neon": True,
+                "neon_strength": 0.6,
+                "pressure_enabled": True,
+                "pressure_min_factor": 0.453,
+            },
+            "tape": {
+                "width": 32.0,
+                "pattern": "stripes",
+                "rgba": [255, 230, 100, 255],
+                "peeled": False,
+            },
+            "connector": {
+                "stroke_width": 2.5,
+                "routing": "curved",
+                "head_end": "arrow",
+                "head_start": "none",
+                "stroke_rgba": [80, 80, 80, 255],
+                "dashed": False,
+                "neon": False,
+                "neon_strength": 0.6,
+            },
+            "insert_space": {
+                "gap": 100.0,
+                "direction": "vertical",
+            },
         }
+
+        self.snap_shapes = False
+        self._active_tape = None
+        self._active_connector = None
+        self._active_space_cut = None
 
         # Active stroke & adaptive 1-Euro filter state
         self._active_stroke = None
@@ -129,6 +163,7 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
         self._stylus_active = False
         self._effective_tool = "pen"
         self._eraser_cursor = None
+        self._pointer_pos = None
         self._last_erase_pt = None
         self._erased_during_drag = False
         self._smoothed_pressure = 0.65
@@ -201,6 +236,7 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
         self.add_controller(self.scroll_controller)
 
         self.motion_controller = Gtk.EventControllerMotion.new()
+        self.motion_controller.connect("enter", self._on_mouse_enter)
         self.motion_controller.connect("motion", self._on_mouse_motion)
         self.motion_controller.connect("leave", self._on_mouse_leave)
         self.add_controller(self.motion_controller)
@@ -211,25 +247,115 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
         self.add_controller(self.click_gesture)
 
 
+    def _on_mouse_enter(self, controller, x, y):
+        self._on_mouse_motion(controller, x, y)
+
     def _on_mouse_motion(self, controller, x, y):
+        if getattr(self, "_middle_drag_start_screen", None) is not None:
+            return
+
         if self.view_mode == "scrolled" and getattr(self, "_new_page_btn_rect", None):
             bx, by, bw, bh = self._new_page_btn_rect
             if bx <= x <= bx + bw and by <= y <= by + bh:
                 if not getattr(self, "_hover_new_page_btn", False):
                     self._hover_new_page_btn = True
                     self.set_cursor_from_name("pointer")
+                if self._pointer_pos is not None:
+                    self._pointer_pos = None
                     self.queue_draw()
                 return
             elif getattr(self, "_hover_new_page_btn", False):
                 self._hover_new_page_btn = False
-                self.set_cursor(None)
-                self.queue_draw()
+
+        if self.is_infinite_canvas() and getattr(self, "show_minimap", True):
+            m_rect = self._get_minimap_rect()
+            if m_rect and self._hit_test_minimap(x, y, m_rect):
+                self.set_cursor_from_name("pointer")
+                if self._pointer_pos is not None:
+                    self._pointer_pos = None
+                    self.queue_draw()
+                return
+
+        # Check selection / transform handles
+        if getattr(self, "document", None):
+            page_idx, px, py = self.widget_to_page_coords(x, y)
+            if page_idx is not None:
+                handle = None
+                if getattr(self, "selected_item_idx", None) is not None and getattr(self, "selected_page_idx", None) == page_idx:
+                    handle = self._hit_test_selection_handles(px, py)
+                elif hasattr(self, "has_lasso_selection") and self.has_lasso_selection() and getattr(self, "lasso_page_idx", None) == page_idx:
+                    handle = self._hit_test_lasso_handles(px, py)
+
+                if handle:
+                    if handle in ("nw", "se"):
+                        self.set_cursor_from_name("nwse-resize")
+                    elif handle in ("ne", "sw"):
+                        self.set_cursor_from_name("nesw-resize")
+                    elif handle == "rotate":
+                        self.set_cursor_from_name("grab")
+                    elif handle == "move":
+                        self.set_cursor_from_name("move")
+                    else:
+                        self.set_cursor_from_name("pointer")
+                    if self._pointer_pos is not None:
+                        self._pointer_pos = None
+                        self.queue_draw()
+                    return
+
+        self._pointer_pos = (x, y)
+        self.set_cursor_from_name("none")
+        self.queue_draw()
 
     def _on_mouse_leave(self, controller):
         if getattr(self, "_hover_new_page_btn", False):
             self._hover_new_page_btn = False
-            self.set_cursor(None)
-            self.queue_draw()
+        self._pointer_pos = None
+        self.set_cursor(None)
+        self.queue_draw()
+
+    def _draw_pointer_cursor(self, cr):
+        if getattr(self, "_pointer_pos", None) is None:
+            return
+        if getattr(self, "_middle_drag_start_screen", None) is not None:
+            return
+        if getattr(self, "_is_minimap_dragging", False):
+            return
+        if getattr(self, "_hover_new_page_btn", False):
+            return
+        if getattr(self, "_eraser_cursor", None) is not None:
+            return
+
+        px, py = self._pointer_pos
+
+        cr.save()
+        tool = getattr(self, "_effective_tool", None) or getattr(self, "active_tool", "pen")
+        if tool == "eraser":
+            r = getattr(self, "eraser_radius", 18.0)
+            cr.set_line_width(2.0)
+            cr.set_source_rgba(0.85, 0.2, 0.25, 0.75)
+            cr.arc(px, py, r, 0, 2 * math.pi)
+            cr.stroke()
+        else:
+            r = 4.0
+            # Subtle pen ink color fill
+            pen_col = getattr(self, "pen_rgba", [0, 0, 0, 255])
+            if pen_col and len(pen_col) >= 3:
+                cr.set_source_rgba(pen_col[0] / 255.0, pen_col[1] / 255.0, pen_col[2] / 255.0, 0.4)
+                cr.arc(px, py, r, 0, 2 * math.pi)
+                cr.fill_preserve()
+            else:
+                cr.arc(px, py, r, 0, 2 * math.pi)
+
+            # Outer contrast outline (dark)
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.75)
+            cr.set_line_width(1.8)
+            cr.stroke_preserve()
+
+            # Inner crisp highlight (white)
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.95)
+            cr.set_line_width(0.9)
+            cr.stroke()
+        cr.restore()
 
     def _dismiss_window_popovers(self):
         root = self.get_root()
@@ -280,7 +406,9 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
 
     def _on_middle_drag_begin(self, gesture, x, y):
         self._middle_drag_start_screen = (x, y)
+        self._pointer_pos = None
         self.set_cursor_from_name("grabbing")
+        self.queue_draw()
         if self.is_infinite_canvas():
             view = self.document.setdefault("view", {})
             self._middle_drag_start_view = (float(view.get("cx", 0.0)), float(view.get("cy", 0.0)))
@@ -307,7 +435,8 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
                 self.hadj.set_value(max(self.hadj.get_lower(), min(max_h, start_h - offset_x)))
 
     def _on_middle_drag_end(self, gesture, offset_x, offset_y):
-        self.set_cursor(None)
+        self._middle_drag_start_screen = None
+        self.set_cursor_from_name("none")
         if self.is_infinite_canvas():
             if self.on_modified_cb:
                 self.on_modified_cb(True)
@@ -583,6 +712,25 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
         if self.on_modified_cb:
             self.on_modified_cb(True)
 
+    def save_undo_state(self, page_idx=None, old_items=None):
+        """Records an undo step for the current document state."""
+        if not self.document:
+            return
+        pages = self.document.get("pages", [])
+        if not pages:
+            return
+        if page_idx is None:
+            page_idx = getattr(self, "_active_page_idx", None)
+            if page_idx is None or not (0 <= page_idx < len(pages)):
+                page_idx = 0
+        if 0 <= page_idx < len(pages):
+            curr = self._clone_items_list(pages[page_idx].get("items", []))
+            prev = old_items if old_items is not None else getattr(self, "_pre_drag_items_snapshot", None)
+            if prev is not None:
+                self._record_undo_step(page_idx, prev, curr, clone=False)
+            else:
+                self._record_undo_step(page_idx, curr, curr, clone=True)
+
     def undo(self):
         if not self.undo_stack or not self.document:
             return
@@ -729,6 +877,17 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
                 "rgba": rgba,
                 "highlighter_alpha": float(h_cfg.get("alpha", 0.5)),
             }
+        elif tool_name == "neon":
+            n_cfg = ts.get("neon", {})
+            cfg = {
+                "base_width": bw,
+                "pressure_enabled": bool(n_cfg.get("pressure_enabled", True)),
+                "pressure_min_factor": float(n_cfg.get("pressure_min_factor", 0.453)),
+                "direction_strength": 0.0,
+                "rgba": rgba,
+                "neon": True,
+                "neon_strength": float(n_cfg.get("neon_strength", 0.6)),
+            }
         else:  # "pen"
             p_cfg = ts.get("pen", {})
             cfg = {
@@ -753,13 +912,16 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
             "smooth_scale": 0.7950984251968506,
             "_bbox": [px - hw, py - hw, px + hw, py + hw],
         }
+        if cfg.get("neon"):
+            stroke["neon"] = True
+            stroke["neon_strength"] = cfg.get("neon_strength", 0.6)
         if tool_name == "speed":
             s_cfg = ts.get("speed", {})
             stroke["speed_scale"] = float(s_cfg.get("speed_scale", 0.5918616115704284))
         return stroke
 
     def _begin_interaction(self, wx, wy, pressure=0.55, is_stylus=False, timestamp_sec=None):
-        if self.is_infinite_canvas() and not is_stylus:
+        if self.is_infinite_canvas() and not is_stylus and getattr(self, "show_minimap", True):
             m_rect = self._get_minimap_rect()
             if m_rect and self._hit_test_minimap(wx, wy, m_rect):
                 self._is_minimap_dragging = True
@@ -834,6 +996,43 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
                 self._transient_skip_indices = {self.selected_item_idx}
                 self.invalidate_page(page_idx, clear_bg=False)
             return
+
+        # Check for interactive TapeItem tap (Active Recall toggle: covered <-> peeled)
+        for it_idx in range(len(page.get("items", [])) - 1, -1, -1):
+            it = page["items"][it_idx]
+            if it.get("kind") == "tape":
+                pts = it.get("points") or []
+                t_w = float(it.get("width", 32.0))
+                hit_tape = False
+                if len(pts) >= 2:
+                    for si in range(len(pts) - 1):
+                        p1x, p1y = float(pts[si][0]), float(pts[si][1])
+                        p2x, p2y = float(pts[si+1][0]), float(pts[si+1][1])
+                        dx, dy = p2x - p1x, p2y - p1y
+                        l2 = dx * dx + dy * dy
+                        if l2 <= 1e-6:
+                            dist = math.hypot(px - p1x, py - p1y)
+                        else:
+                            t = max(0.0, min(1.0, ((px - p1x) * dx + (py - p1y) * dy) / l2))
+                            dist = math.hypot(px - (p1x + t * dx), py - (p1y + t * dy))
+                        if dist <= t_w / 2.0 + 4.0:
+                            hit_tape = True
+                            break
+                else:
+                    rect = it.get("rect")
+                    if rect and len(rect) >= 4:
+                        rx, ry, rw, rh = float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3])
+                        if rx <= px <= rx + rw and ry <= py <= ry + rh:
+                            hit_tape = True
+                if hit_tape:
+                    old_items = self._clone_items_list(page.get("items", []))
+                    it["peeled"] = not bool(it.get("peeled", False))
+                    new_items = self._clone_items_list(page.get("items", []))
+                    self._record_undo_step(page_idx, old_items, new_items, clone=False)
+                    self.invalidate_page(page_idx, clear_bg=False)
+                    self.queue_draw()
+                    self._active_page_idx = None
+                    return
 
         # Check for interactive audio item click (Play/Pause disc or waveform seek) when not in select tool
         for it_idx in range(len(page.get("items", [])) - 1, -1, -1):
@@ -929,6 +1128,51 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
                 "stroke_width": s_width,
                 "fill": s_fill,
                 "angle": 0.0,
+            }
+            self.queue_draw()
+            return
+
+        if self._effective_tool == "tape":
+            self.clear_selection()
+            self._pre_drag_items_snapshot = self._clone_items_list(page.get("items", []))
+            t_cfg = self.tool_settings.get("tape", {})
+            self._active_tape = {
+                "kind": "tape",
+                "points": [[round(px, 2), round(py, 2)], [round(px, 2), round(py, 2)]],
+                "width": float(t_cfg.get("width", 32.0)),
+                "pattern": t_cfg.get("pattern", "stripes"),
+                "rgba": list(t_cfg.get("rgba", [255, 230, 100, 255])),
+                "peeled": False,
+            }
+            self.queue_draw()
+            return
+
+        if self._effective_tool == "connector":
+            self.clear_selection()
+            self._pre_drag_items_snapshot = self._clone_items_list(page.get("items", []))
+            c_cfg = self.tool_settings.get("connector", {})
+            self._active_connector = {
+                "kind": "connector",
+                "points": [[round(px, 2), round(py, 2)], [round(px, 2), round(py, 2)]],
+                "stroke_width": float(c_cfg.get("stroke_width", 2.5)),
+                "routing": c_cfg.get("routing", "curved"),
+                "head_end": c_cfg.get("head_end", "arrow"),
+                "head_start": c_cfg.get("head_start", "none"),
+                "stroke_rgba": list(c_cfg.get("stroke_rgba", [80, 80, 80, 255])),
+                "dashed": bool(c_cfg.get("dashed", False)),
+                "neon": bool(c_cfg.get("neon", False)),
+                "neon_strength": float(c_cfg.get("neon_strength", 0.6)),
+            }
+            self.queue_draw()
+            return
+
+        if self._effective_tool == "insert_space":
+            self.clear_selection()
+            self._pre_drag_items_snapshot = self._clone_items_list(page.get("items", []))
+            self._active_space_cut = {
+                "start_y": py,
+                "current_y": py,
+                "page_idx": page_idx,
             }
             self.queue_draw()
             return
@@ -1075,6 +1319,24 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
                         elif kind in ("image", "picture"):
                             orect = orig_it.get("rect", [0.0, 0.0, 100.0, 100.0])
                             cur_it["rect"] = [round(orect[0] + dx, 2), round(orect[1] + dy, 2), orect[2], orect[3]]
+                        elif kind == "shape":
+                            orect = orig_it.get("rect", [0.0, 0.0, 10.0, 10.0])
+                            cur_it["rect"] = [round(orect[0] + dx, 2), round(orect[1] + dy, 2), orect[2], orect[3]]
+                            if orig_it.get("start_pt"):
+                                cur_it["start_pt"] = [round(orig_it["start_pt"][0] + dx, 2), round(orig_it["start_pt"][1] + dy, 2)]
+                            if orig_it.get("end_pt"):
+                                cur_it["end_pt"] = [round(orig_it["end_pt"][0] + dx, 2), round(orig_it["end_pt"][1] + dy, 2)]
+                            if orig_it.get("points"):
+                                cur_it["points"] = [[round(p[0] + dx, 2), round(p[1] + dy, 2)] for p in orig_it["points"]]
+                        elif kind in ("tape", "connector"):
+                            if orig_it.get("points"):
+                                cur_it["points"] = [[round(p[0] + dx, 2), round(p[1] + dy, 2)] for p in orig_it["points"]]
+                            if orig_it.get("rect"):
+                                orect = orig_it["rect"]
+                                cur_it["rect"] = [round(orect[0] + dx, 2), round(orect[1] + dy, 2), orect[2], orect[3]]
+                        elif kind == "audio":
+                            orect = orig_it.get("rect", [0.0, 0.0, 230.0, 48.0])
+                            cur_it["rect"] = [round(orect[0] + dx, 2), round(orect[1] + dy, 2), orect[2], orect[3]]
 
                     self.lasso_bbox = [obx + dx, oby + dy, obw, obh]
                     self._lasso_modified = True
@@ -1153,6 +1415,39 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
                                 round(ny + (orect[1] - oby) * sy, 2),
                                 round(orect[2] * sx, 2),
                                 round(orect[3] * sy, 2)
+                            ]
+                        elif kind == "shape":
+                            orect = orig_it.get("rect", [0.0, 0.0, 10.0, 10.0])
+                            cur_it["rect"] = [
+                                round(nx + (orect[0] - obx) * sx, 2),
+                                round(ny + (orect[1] - oby) * sy, 2),
+                                round(max(2.0, orect[2] * sx), 2),
+                                round(max(2.0, orect[3] * sy), 2),
+                            ]
+                            if orig_it.get("start_pt"):
+                                cur_it["start_pt"] = [round(nx + (orig_it["start_pt"][0] - obx) * sx, 2), round(ny + (orig_it["start_pt"][1] - oby) * sy, 2)]
+                            if orig_it.get("end_pt"):
+                                cur_it["end_pt"] = [round(nx + (orig_it["end_pt"][0] - obx) * sx, 2), round(ny + (orig_it["end_pt"][1] - oby) * sy, 2)]
+                            if orig_it.get("points"):
+                                cur_it["points"] = [[round(nx + (p[0] - obx) * sx, 2), round(ny + (p[1] - oby) * sy, 2)] for p in orig_it["points"]]
+                        elif kind in ("tape", "connector"):
+                            if orig_it.get("points"):
+                                cur_it["points"] = [[round(nx + (p[0] - obx) * sx, 2), round(ny + (p[1] - oby) * sy, 2)] for p in orig_it["points"]]
+                            if orig_it.get("rect"):
+                                orect = orig_it["rect"]
+                                cur_it["rect"] = [
+                                    round(nx + (orect[0] - obx) * sx, 2),
+                                    round(ny + (orect[1] - oby) * sy, 2),
+                                    round(max(2.0, orect[2] * sx), 2),
+                                    round(max(2.0, orect[3] * sy), 2),
+                                ]
+                        elif kind == "audio":
+                            orect = orig_it.get("rect", [0.0, 0.0, 230.0, 48.0])
+                            cur_it["rect"] = [
+                                round(nx + (orect[0] - obx) * sx, 2),
+                                round(ny + (orect[1] - oby) * sy, 2),
+                                orect[2],
+                                orect[3],
                             ]
 
                     self.lasso_bbox = [nx, ny, nw, nh]
@@ -1312,6 +1607,27 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
             w = max(10.0, abs(px - start_x))
             h = max(10.0, abs(py - start_y))
             self._active_text_box["rect"] = [round(min_x, 2), round(min_y, 2), round(w, 2), round(h, 2)]
+            if queue_redraw:
+                self.queue_draw()
+            return True
+
+        # --- Active Tape Tool Drag ---
+        if self._effective_tool == "tape" and getattr(self, "_active_tape", None) is not None:
+            self._active_tape["points"][1] = [round(px, 2), round(py, 2)]
+            if queue_redraw:
+                self.queue_draw()
+            return True
+
+        # --- Active Connector Tool Drag ---
+        if self._effective_tool == "connector" and getattr(self, "_active_connector", None) is not None:
+            self._active_connector["points"][1] = [round(px, 2), round(py, 2)]
+            if queue_redraw:
+                self.queue_draw()
+            return True
+
+        # --- Active Insert Space Cut Drag ---
+        if self._effective_tool == "insert_space" and getattr(self, "_active_space_cut", None) is not None:
+            self._active_space_cut["current_y"] = py
             if queue_redraw:
                 self.queue_draw()
             return True
@@ -1537,7 +1853,111 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
             self._active_page_idx = None
             return
 
+        if self._effective_tool == "tape" and getattr(self, "_active_tape", None) is not None:
+            tape_to_place = self._active_tape
+            self._active_tape = None
+            pts = tape_to_place.get("points", [])
+            if len(pts) >= 2:
+                dist = math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1])
+                if dist >= 6.0:
+                    page.setdefault("items", []).append(tape_to_place)
+                    self._record_undo_step(
+                        self._active_page_idx,
+                        self._pre_drag_items_snapshot,
+                        self._clone_items_list(page["items"]),
+                        clone=False
+                    )
+                    self.invalidate_page(self._active_page_idx, clear_bg=False)
+            self._active_page_idx = None
+            self._pre_drag_items_snapshot = None
+            self.queue_draw()
+            return
+
+        if self._effective_tool == "connector" and getattr(self, "_active_connector", None) is not None:
+            conn_to_place = self._active_connector
+            self._active_connector = None
+            pts = conn_to_place.get("points", [])
+            if len(pts) >= 2:
+                dist = math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1])
+                if dist >= 6.0:
+                    page.setdefault("items", []).append(conn_to_place)
+                    self._record_undo_step(
+                        self._active_page_idx,
+                        self._pre_drag_items_snapshot,
+                        self._clone_items_list(page["items"]),
+                        clone=False
+                    )
+                    self.invalidate_page(self._active_page_idx, clear_bg=False)
+            self._active_page_idx = None
+            self._pre_drag_items_snapshot = None
+            self.queue_draw()
+            return
+
+        if self._effective_tool == "insert_space" and getattr(self, "_active_space_cut", None) is not None:
+            sc = self._active_space_cut
+            self._active_space_cut = None
+            start_y = sc["start_y"]
+            delta_y = sc["current_y"] - start_y
+            if abs(delta_y) >= 8.0:
+                for it in page.get("items", []):
+                    kind = it.get("kind") or it.get("type")
+                    if kind == "stroke":
+                        pts = it.get("samples") or it.get("points") or []
+                        ys = [float(s["y"]) if isinstance(s, dict) else float(s[1]) for s in pts]
+                        if ys and min(ys) >= start_y:
+                            for s in pts:
+                                if isinstance(s, dict):
+                                    s["y"] = round(s["y"] + delta_y, 2)
+                                else:
+                                    s[1] = round(s[1] + delta_y, 2)
+                            it.pop("_bbox", None)
+                            it.pop("_render_cache", None)
+                    elif kind in ("shape", "image", "picture", "text", "audio"):
+                        rect = it.get("rect")
+                        if rect and len(rect) >= 4 and rect[1] >= start_y:
+                            rect[1] = round(rect[1] + delta_y, 2)
+                            if it.get("start_pt") and it["start_pt"][1] >= start_y:
+                                it["start_pt"][1] = round(it["start_pt"][1] + delta_y, 2)
+                            if it.get("end_pt") and it["end_pt"][1] >= start_y:
+                                it["end_pt"][1] = round(it["end_pt"][1] + delta_y, 2)
+                            if it.get("pos") and it["pos"][1] >= start_y:
+                                it["pos"][1] = round(it["pos"][1] + delta_y, 2)
+                    elif kind in ("tape", "connector"):
+                        pts = it.get("points") or []
+                        ys = [float(p[1]) for p in pts]
+                        if ys and min(ys) >= start_y:
+                            for p in pts:
+                                p[1] = round(p[1] + delta_y, 2)
+                self._record_undo_step(
+                    self._active_page_idx,
+                    self._pre_drag_items_snapshot,
+                    self._clone_items_list(page["items"]),
+                    clone=False
+                )
+                self.invalidate_page(self._active_page_idx, clear_bg=False)
+            self._active_page_idx = None
+            self._pre_drag_items_snapshot = None
+            self.queue_draw()
+            return
+
         if self._active_stroke is not None:
+            if getattr(self, "snap_shapes", False):
+                snapped_shape = self._try_snap_stroke_to_shape(self._active_stroke)
+                if snapped_shape is not None:
+                    page.setdefault("items", []).append(snapped_shape)
+                    self._record_undo_step(
+                        self._active_page_idx,
+                        self._pre_drag_items_snapshot,
+                        self._clone_items_list(page["items"]),
+                        clone=False
+                    )
+                    self.invalidate_page(self._active_page_idx, clear_bg=False)
+                    self._active_stroke = None
+                    self._active_page_idx = None
+                    self._pre_drag_items_snapshot = None
+                    self.queue_draw()
+                    return
+
             raw_samples = self._active_stroke["samples"]
             if len(raw_samples) == 1:
                 s0 = raw_samples[0]
@@ -1566,6 +1986,109 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
         self._active_page_idx = None
         self._pre_drag_items_snapshot = None
         self.queue_draw()
+
+    def _try_snap_stroke_to_shape(self, stroke):
+        """Hold-to-snap shape recognizer (parity with Android ShapeRecognizer)."""
+        raw_samples = stroke.get("samples") or stroke.get("points") or []
+        if len(raw_samples) < 8:
+            return None
+        pts = [(float(s["x"]), float(s["y"])) if isinstance(s, dict) else (float(s[0]), float(s[1])) for s in raw_samples]
+        cfg = stroke.get("config", {})
+        bw = float(cfg.get("base_width", stroke.get("stroke_width", 3.5)))
+        rgba = cfg.get("rgba") or stroke.get("stroke_rgba") or stroke.get("color") or list(self.pen_rgba)
+        is_neon = bool(stroke.get("neon") or cfg.get("neon"))
+        neon_s = float(stroke.get("neon_strength", cfg.get("neon_strength", 0.6)))
+
+        x0, y0 = pts[0]
+        xN, yN = pts[-1]
+        chord_len = math.hypot(xN - x0, yN - y0)
+        total_len = 0.0
+        for i in range(len(pts) - 1):
+            total_len += math.hypot(pts[i+1][0] - pts[i][0], pts[i+1][1] - pts[i][1])
+
+        if total_len < 16.0:
+            return None
+
+        # 1. Check for straight line
+        if chord_len / total_len > 0.94:
+            min_x = min(x0, xN)
+            min_y = min(y0, yN)
+            w = max(2.0, abs(xN - x0))
+            h = max(2.0, abs(yN - y0))
+            return {
+                "kind": "shape",
+                "shape_type": "line",
+                "start_pt": [round(x0, 2), round(y0, 2)],
+                "end_pt": [round(xN, 2), round(yN, 2)],
+                "rect": [round(min_x, 2), round(min_y, 2), round(w, 2), round(h, 2)],
+                "rgba": list(rgba),
+                "stroke_width": bw,
+                "fill": False,
+                "neon": is_neon,
+                "neon_strength": neon_s,
+            }
+
+        # 2. Check for closed loop (Circle, Ellipse, Rectangle)
+        if chord_len / total_len < 0.22:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            w = max(10.0, max_x - min_x)
+            h = max(10.0, max_y - min_y)
+            cx = (min_x + max_x) / 2.0
+            cy = (min_y + max_y) / 2.0
+            rx = w / 2.0
+            ry = h / 2.0
+
+            ellipse_err = 0.0
+            for px, py in pts:
+                val = ((px - cx) / rx) ** 2 + ((py - cy) / ry) ** 2
+                ellipse_err += abs(val - 1.0)
+            avg_ellipse_err = ellipse_err / len(pts)
+
+            if avg_ellipse_err < 0.26:
+                is_circle = abs(w - h) / max(w, h) < 0.20
+                stype = "circle" if is_circle else "ellipse"
+                if is_circle:
+                    dim = (w + h) / 2.0
+                    min_x = cx - dim / 2.0
+                    min_y = cy - dim / 2.0
+                    w = h = dim
+                return {
+                    "kind": "shape",
+                    "shape_type": stype,
+                    "start_pt": [round(min_x, 2), round(min_y, 2)],
+                    "end_pt": [round(min_x + w, 2), round(min_y + h, 2)],
+                    "rect": [round(min_x, 2), round(min_y, 2), round(w, 2), round(h, 2)],
+                    "rgba": list(rgba),
+                    "stroke_width": bw,
+                    "fill": False,
+                    "neon": is_neon,
+                    "neon_strength": neon_s,
+                }
+
+            rect_margin = 0.22 * min(w, h)
+            near_edges = 0
+            for px, py in pts:
+                if (abs(px - min_x) <= rect_margin or abs(px - max_x) <= rect_margin or
+                    abs(py - min_y) <= rect_margin or abs(py - max_y) <= rect_margin):
+                    near_edges += 1
+            if near_edges / len(pts) > 0.82:
+                return {
+                    "kind": "shape",
+                    "shape_type": "rectangle",
+                    "start_pt": [round(min_x, 2), round(min_y, 2)],
+                    "end_pt": [round(max_x, 2), round(max_y, 2)],
+                    "rect": [round(min_x, 2), round(min_y, 2), round(w, 2), round(h, 2)],
+                    "rgba": list(rgba),
+                    "stroke_width": bw,
+                    "fill": False,
+                    "neon": is_neon,
+                    "neon_strength": neon_s,
+                }
+
+        return None
 
     # --- Stylus Signals (Coalesced High-Rate Hardware Backlog Processing) ---
     def _on_stylus_down(self, gesture, x, y):
@@ -1616,6 +2139,8 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
             if bx <= start_x <= bx + bw and by <= start_y <= by + bh:
                 gesture.set_state(Gtk.EventSequenceState.DENIED)
                 return
+        self._pointer_pos = (start_x, start_y)
+        self.set_cursor_from_name("none")
         self._begin_interaction(start_x, start_y, pressure=0.55, is_stylus=False)
 
     def _on_drag_update(self, gesture, offset_x, offset_y):
@@ -1625,11 +2150,17 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
             return
         ok, start_x, start_y = gesture.get_start_point()
         if ok:
-            self._update_interaction(start_x + offset_x, start_y + offset_y, pressure=0.55, is_stylus=False)
+            cur_x = start_x + offset_x
+            cur_y = start_y + offset_y
+            self._pointer_pos = (cur_x, cur_y)
+            self._update_interaction(cur_x, cur_y, pressure=0.55, is_stylus=False)
 
     def _on_drag_end(self, gesture, offset_x, offset_y):
         if self._stylus_active:
             return
+        ok, start_x, start_y = gesture.get_start_point()
+        if ok:
+            self._pointer_pos = (start_x + offset_x, start_y + offset_y)
         self._end_interaction()
 
     # =========================================================================
@@ -2118,6 +2649,46 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
             self.draw_shape(cr, self._active_shape, is_preview=True)
             cr.restore()
 
+        if getattr(self, "_active_tape", None) is not None and self._active_page_idx == page_idx:
+            cr.save()
+            cr.translate(offset_x, offset_y)
+            cr.scale(self.zoom_level, self.zoom_level)
+            cr.rectangle(0, 0, pw, ph)
+            cr.clip()
+            self.draw_tape(cr, self._active_tape)
+            cr.restore()
+
+        if getattr(self, "_active_connector", None) is not None and self._active_page_idx == page_idx:
+            cr.save()
+            cr.translate(offset_x, offset_y)
+            cr.scale(self.zoom_level, self.zoom_level)
+            cr.rectangle(0, 0, pw, ph)
+            cr.clip()
+            self.draw_connector(cr, self._active_connector)
+            cr.restore()
+
+        if getattr(self, "_active_space_cut", None) is not None and self._active_page_idx == page_idx:
+            sc = self._active_space_cut
+            y0 = sc["start_y"]
+            y1 = sc["current_y"]
+            cr.save()
+            cr.translate(offset_x, offset_y)
+            cr.scale(self.zoom_level, self.zoom_level)
+            cr.set_source_rgba(0.2, 0.5, 0.9, 0.85)
+            cr.set_line_width(2.0 / max(0.1, self.zoom_level))
+            cr.set_dash([6.0, 4.0])
+            cr.move_to(0, y0)
+            cr.line_to(pw, y0)
+            cr.stroke()
+            cr.set_source_rgba(0.2, 0.5, 0.9, 0.15)
+            cr.rectangle(0, min(y0, y1), pw, abs(y1 - y0))
+            cr.fill()
+            cr.set_source_rgba(0.2, 0.5, 0.9, 0.85)
+            cr.move_to(0, y1)
+            cr.line_to(pw, y1)
+            cr.stroke()
+            cr.restore()
+
         # Clean 2px border around the page (1px larger, no shadow)
         cr.save()
         cr.set_source_rgba(0.0, 0.0, 0.0, 0.22)
@@ -2168,7 +2739,9 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
                 cr.arc(ex, ey, self.eraser_radius, 0, 2 * math.pi)
                 cr.stroke()
                 cr.restore()
-            self._draw_minimap(cr, width, height)
+            if getattr(self, "show_minimap", True):
+                self._draw_minimap(cr, width, height)
+            self._draw_pointer_cursor(cr)
             return
 
         pages = self.document.get("pages", [])
@@ -2201,6 +2774,7 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
 
                 if t >= 1.0:
                     self._page_transition = None
+                self._draw_pointer_cursor(cr)
                 return
 
             pages_to_draw = []
@@ -2258,6 +2832,8 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
             cr.arc(ex, ey, self.eraser_radius, 0, 2 * math.pi)
             cr.stroke()
             cr.restore()
+
+        self._draw_pointer_cursor(cr)
 
 
     def _draw_new_page_button(self, cr, x, y, w, h):
@@ -2488,6 +3064,32 @@ class XNoteCanvas(Gtk.DrawingArea, CanvasRendererMixin, CanvasSelectionMixin):
 
         if self._active_shape:
             self.draw_shape(cr, self._active_shape, is_preview=True)
+
+        if getattr(self, "_active_tape", None) is not None:
+            self.draw_tape(cr, self._active_tape)
+
+        if getattr(self, "_active_connector", None) is not None:
+            self.draw_connector(cr, self._active_connector)
+
+        if getattr(self, "_active_space_cut", None) is not None:
+            sc = self._active_space_cut
+            y0 = sc["start_y"]
+            y1 = sc["current_y"]
+            cr.save()
+            cr.set_source_rgba(0.2, 0.5, 0.9, 0.85)
+            cr.set_line_width(2.0 / max(0.1, self.zoom_level))
+            cr.set_dash([6.0, 4.0])
+            cr.move_to(-10000.0, y0)
+            cr.line_to(10000.0, y0)
+            cr.stroke()
+            cr.set_source_rgba(0.2, 0.5, 0.9, 0.15)
+            cr.rectangle(-10000.0, min(y0, y1), 20000.0, abs(y1 - y0))
+            cr.fill()
+            cr.set_source_rgba(0.2, 0.5, 0.9, 0.85)
+            cr.move_to(-10000.0, y1)
+            cr.line_to(10000.0, y1)
+            cr.stroke()
+            cr.restore()
 
         if self._sized_text_box and self._sized_text_box.get("rect"):
             tb = self._sized_text_box

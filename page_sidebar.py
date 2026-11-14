@@ -95,15 +95,6 @@ class PageSidebarMixin:
             drop_target.connect("drop", _on_drop)
             row.add_controller(drop_target)
 
-            # Secondary click context menu
-            right_click = Gtk.GestureClick.new()
-            right_click.set_button(3)
-
-            def _on_row_right_click(gesture, n_press, x, y, p_i=idx):
-                self._show_page_context_menu(row, p_i, x, y)
-
-            right_click.connect("pressed", _on_row_right_click)
-            row.add_controller(right_click)
 
             vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, halign=Gtk.Align.CENTER)
 
@@ -399,25 +390,6 @@ class PageSidebarMixin:
             GLib.idle_add(self.scroll_to_page, insert_pos)
         self.show_toast(f"Pasted Page into position {insert_pos + 1}")
 
-    def _show_page_context_menu(self, row, page_idx, x, y):
-        """Show contextual right-click menu for a page."""
-        pages = self.canvas.document.get("pages", []) if self.canvas.document else []
-        total = len(pages)
-
-        menu = Gio.Menu()
-        menu.append("Copy Page", f"win.copy-page-{page_idx}")
-        if total > 1:
-            menu.append("Cut Page", f"win.cut-page-{page_idx}")
-        menu.append("Paste Page After", f"win.paste-page-{page_idx}")
-        menu.append("Duplicate Page", f"win.dup-page-{page_idx}")
-        if total > 1:
-            menu.append("Delete Page", f"win.del-page-{page_idx}")
-
-        # Popover menu
-        pop = Gtk.PopoverMenu.new_from_model(menu)
-        pop.set_parent(row)
-        pop.set_pointing_to(Gdk.Rectangle(x=int(x), y=int(y), width=1, height=1))
-        pop.popup()
 
     def duplicate_page(self, page_idx):
         if not self.canvas.document:
